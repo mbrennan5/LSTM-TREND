@@ -95,7 +95,7 @@ TITAN_SYMBOLS = [
 # ==============================================================================
 
 # ── Linear slope (replaces np.polyfit inside rolling) ─────────────────────────
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def _lin_slope_nb(y):
     """OLS slope — equivalent to np.polyfit(x, y, 1)[0] but ~20× faster."""
     n = len(y)
@@ -111,7 +111,7 @@ def _lin_slope_nb(y):
         den += dx * dx
     return num / den if den != 0.0 else 0.0
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def _rolling_linslope(arr, window):
     n = len(arr); out = np.full(n, 0.0)
     for i in range(window - 1, n):
@@ -119,7 +119,7 @@ def _rolling_linslope(arr, window):
     return out
 
 # ── Hurst exponent ─────────────────────────────────────────────────────────────
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def _hurst_nb(y):
     n = len(y)
     if n < 2: return 0.5
@@ -133,7 +133,7 @@ def _hurst_nb(y):
     r = np.log(std + 1e-9) / np.log(n)
     return r if not np.isnan(r) else 0.5
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def _rolling_hurst(arr, window):
     n = len(arr); out = np.full(n, 0.5)
     for i in range(window - 1, n):
@@ -141,7 +141,7 @@ def _rolling_hurst(arr, window):
     return out
 
 # ── Center of Gravity ──────────────────────────────────────────────────────────
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def _cog_nb(y):
     n = len(y)
     if n < 2: return 0.0
@@ -152,7 +152,7 @@ def _cog_nb(y):
         den += y[i]
     return -num / (den + 1e-9)
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def _rolling_cog(arr, window):
     n = len(arr); out = np.full(n, 0.0)
     for i in range(window - 1, n):
@@ -160,7 +160,7 @@ def _rolling_cog(arr, window):
     return out
 
 # ── Shannon entropy (manual histogram — np.histogram not in nopython) ──────────
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def _shannon_nb(y, bins=10):
     n = len(y)
     if n < 2: return 0.0
@@ -180,7 +180,7 @@ def _shannon_nb(y, bins=10):
         entropy -= p * np.log(p)
     return entropy
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def _rolling_shannon(arr, window):
     n = len(arr); out = np.full(n, 0.0)
     for i in range(window - 1, n):
@@ -188,7 +188,7 @@ def _rolling_shannon(arr, window):
     return out
 
 # ── R-squared (correlation² of index vs values) ────────────────────────────────
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def _r_sq_nb(y):
     n = len(y)
     if n < 2: return 0.0
@@ -206,7 +206,7 @@ def _r_sq_nb(y):
     r = num / ((den_x ** 0.5) * (den_y ** 0.5))
     return r * r
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def _rolling_r_sq(arr, window):
     n = len(arr); out = np.full(n, 0.0)
     for i in range(window - 1, n):
@@ -214,7 +214,7 @@ def _rolling_r_sq(arr, window):
     return out
 
 # ── Weighted Moving Average ────────────────────────────────────────────────────
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def _rolling_wma(arr, window):
     n = len(arr); out = np.full(n, np.nan)
     w_sum = window * (window + 1) / 2.0
@@ -226,7 +226,7 @@ def _rolling_wma(arr, window):
     return out
 
 # ── Kalman filter ──────────────────────────────────────────────────────────────
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, fastmath=True)
 def _kalman_numba(price, r=0.0001, q=0.001):
     x_hat = np.zeros_like(price); p = np.zeros_like(price)
     x_hat[0] = price[0]; p[0] = 1.0
@@ -258,7 +258,8 @@ _warm_up_numba()
 def generate_factory_features_v2(df):
     df = df.copy()
     df['hlc3']    = (df['high'] + df['low'] + df['close']) / 3
-    df['T_FINAL'] = np.where(df['close'].shift(-1) > df['close'], 1, 0)
+    df['T_FINAL'] = (df['close'].shift(-1) > df['close']).astype('float')
+    df.loc[df.index[-1], 'T_FINAL'] = np.nan   # no future close on last row
 
     hlc = df['hlc3'].values.astype(np.float64)
     hi  = df['high'].values.astype(np.float64)
@@ -430,7 +431,7 @@ def _process_symbol_worker(args):
     try:
         raw_df = pd.DataFrame(raw_dict)
         raw_df.index = pd.to_datetime(raw_df.index)
-        if len(raw_df) < 120:
+        if len(raw_df) < 400:
             return None
         processed = generate_factory_features_v2(raw_df)
         if processed.empty:
@@ -445,9 +446,9 @@ def _process_symbol_worker(args):
 # Phase 1: parallel network I/O   (ThreadPoolExecutor)
 # Phase 2: parallel feature gen   (ProcessPoolExecutor — true multi-core)
 # ==============================================================================
-def fetch_data(symbol):
+def fetch_data(symbol, period="6y"):
     try:
-        data = yf.download(symbol, period="2y", interval="1d", progress=False)
+        data = yf.download(symbol, period=period, interval="1d", progress=False)
         if data.empty:
             return None
         if isinstance(data.columns, pd.MultiIndex):
@@ -458,17 +459,19 @@ def fetch_data(symbol):
         return None
 
 def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
-    print(f"📥 Parallel download: {len(symbol_list)} symbols...")
+    # DIRECTION needs 6y history; EASE/EXP need 4y
+    period = "6y" if brain_name == "DIRECTION" else "4y"
+    print(f"📥 Parallel download: {len(symbol_list)} symbols (period={period})...")
     raw_results = {}
 
     # ── Phase 1: parallel I/O ──────────────────────────────────────────────────
     with ThreadPoolExecutor(max_workers=dl_workers) as pool:
-        fut_map = {pool.submit(fetch_data, sym): sym for sym in symbol_list}
+        fut_map = {pool.submit(fetch_data, sym, period): sym for sym in symbol_list}
         for fut in tqdm(as_completed(fut_map), total=len(symbol_list),
                         desc="⬇ Downloading"):
             sym  = fut_map[fut]
             data = fut.result()
-            if data is not None and len(data) >= 120:
+            if data is not None and len(data) >= 400:   # spec: 400 raw rows minimum
                 raw_results[sym] = data
 
     print(f"   ✅ {len(raw_results)}/{len(symbol_list)} symbols fetched")
@@ -537,27 +540,37 @@ def _eval_accuracy(model, X_batch, y_batch):
                        tf.cast(y_batch, tf.int32))
     return tf.reduce_mean(tf.cast(correct, tf.float32))
 
+WARMUP_ROWS = 350  # first N rows have unreliable indicator values — excluded from scaler fit
+
 def run_judicial_audit(brain_name, master_df, model_type='GRU',
-                       seq_len=10, epochs=5, batch_size=1024):
+                       seq_len=30, epochs=20, batch_size=2048):
     feature_cols = [c for c in master_df.columns
                     if c.startswith('LENS_') or c.startswith('WIN_')]
     n_features   = len(feature_cols)
 
-    scaler   = RobustScaler()
-    X_scaled = scaler.fit_transform(
-        master_df[feature_cols].values
-    ).astype(np.float32)
-    y_raw    = master_df['T_FINAL'].values.astype(np.float32)
+    X_raw = master_df[feature_cols].values
+    y_raw = master_df['T_FINAL'].values.astype(np.float32)
+    n     = len(X_raw)
+    n_seq = n - seq_len
 
-    n      = len(X_scaled)
+    # ── Walk-forward 70 / 15 / 15 split ───────────────────────────────────────
+    train_end = int(n_seq * 0.70)
+    val_end   = int(n_seq * 0.85)
+
+    # ── Scaler fit on training rows only, warmup rows excluded ────────────────
+    scaler = RobustScaler()
+    scaler.fit(X_raw[WARMUP_ROWS : seq_len + train_end])
+    X_scaled = scaler.transform(X_raw).astype(np.float32)
+
     X_seqs = np.stack([X_scaled[i - seq_len:i] for i in range(seq_len, n)])
     y_seqs = y_raw[seq_len:]
 
-    split       = int(len(X_seqs) * 0.8)
-    X_tr, X_val = X_seqs[:split], X_seqs[split:]
-    y_tr, y_val = y_seqs[:split], y_seqs[split:]
+    X_tr  = X_seqs[:train_end];  y_tr  = y_seqs[:train_end]
+    X_val = X_seqs[train_end:val_end]; y_val = y_seqs[train_end:val_end]
+    X_te  = X_seqs[val_end:];   y_te  = y_seqs[val_end:]
 
-    print(f"  [DATA] train={len(X_tr):,}  val={len(X_val):,}  features={n_features}")
+    print(f"  [DATA] train={len(X_tr):,}  val={len(X_val):,}  "
+          f"test={len(X_te):,}  features={n_features}")
 
     AUTO     = tf.data.AUTOTUNE
     train_ds = (tf.data.Dataset.from_tensor_slices((X_tr, y_tr))
@@ -582,7 +595,21 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
     X_val_tf     = tf.constant(X_val)
     y_val_tf     = tf.constant(y_val)
     baseline_acc = _eval_accuracy(model, X_val_tf, y_val_tf).numpy()
-    print(f"  [MODEL] Baseline val accuracy: {baseline_acc:.4f}")
+    print(f"  [MODEL] Val accuracy:  {baseline_acc:.4f}")
+
+    # ── Quality gate: reject iterations with no signal ─────────────────────────
+    if baseline_acc < 0.52:
+        del model; gc.collect(); tf.keras.backend.clear_session()
+        print(f"  ⚠️  Quality gate FAILED: val_acc={baseline_acc:.4f} < 0.52 — no signal")
+        return pd.DataFrame()
+
+    # ── Held-out test evaluation (never touched during training) ──────────────
+    X_te_tf  = tf.constant(X_te)
+    y_te_tf  = tf.constant(y_te)
+    test_acc = _eval_accuracy(model, X_te_tf, y_te_tf).numpy()
+    print(f"  [MODEL] Test accuracy: {test_acc:.4f}")
+    if test_acc > 0.70 and baseline_acc > 0.70:
+        print(f"  🚨 LEAKAGE WARNING: val={baseline_acc:.4f}, test={test_acc:.4f} — investigate!")
 
     report_rows = []
     for fi, feat_name in enumerate(tqdm(feature_cols, desc="Permutation scoring")):
@@ -687,14 +714,16 @@ def apply_sovereign_hunt(ledger_df, master_data_df, brain_name, max_slots=19):
 
     pca = PCA()
     pca.fit(RobustScaler().fit_transform(master_data_df[picked]))
-    return picked, np.cumsum(pca.explained_variance_ratio_)
+    cumvar  = np.cumsum(pca.explained_variance_ratio_)
+    n_for_95 = int(np.searchsorted(cumvar, 0.95)) + 1   # components needed for 95% variance
+    return picked, cumvar, n_for_95
 
 def generate_judicial_ledger(brain_name, report_df, master_data_df, iteration=1):
     df           = report_df.copy()
     df['I_Norm'] = (df['I_raw'] - df['I_raw'].min()) / \
                    (df['I_raw'].max() - df['I_raw'].min() + 1e-9)
 
-    active_picks, var_map = apply_sovereign_hunt(df, master_data_df, brain_name)
+    active_picks, var_map, n95 = apply_sovereign_hunt(df, master_data_df, brain_name)
     corr_sub = master_data_df[active_picks].corr().abs()
     avg_corr = ((corr_sub.sum().sum() - len(active_picks)) /
                 (len(active_picks)**2 - len(active_picks) + 1e-9))
@@ -716,9 +745,9 @@ def generate_judicial_ledger(brain_name, report_df, master_data_df, iteration=1)
         df.loc[df['Feature'] == f_name,
                ['UV%', 'Max_R', 'Is_Locked']] = [uv_val, max_r, is_locked]
 
-    total_var = var_map[-1] if len(var_map) > 0 else 0
     print("╠" + "═"*73 + "╣")
-    print(f"║ PCA TOTAL VARIANCE RETENTION: {total_var*100:>33.2f}% ║")
+    print(f"║ PCA 95% VAR THRESHOLD: {n95:>2} of {len(active_picks)} components needed"
+          f"{'':>26}║")
     print(f"║ AVG TEAM CROSS-CORRELATION:   {avg_corr:>35.3f} ║")
     print(f"║ SLOTS FILLED:                 {len(active_picks):>35}/19 ║")
     print("╚" + "═"*73 + "╝")
@@ -753,8 +782,12 @@ for BRAIN in BRAINS_TO_RUN:
             print("  ⚠️  Empty master_df — skipping.")
             continue
 
-        report_raw       = run_judicial_audit(BRAIN, master_df,
-                                              model_type=CURRENT_MODEL_TYPE)
+        report_raw = run_judicial_audit(BRAIN, master_df,
+                                        model_type=CURRENT_MODEL_TYPE)
+        if report_raw.empty:
+            print("  ⚠️  Quality gate — iteration skipped.")
+            continue
+
         iteration_ledger = generate_judicial_ledger(BRAIN, report_raw,
                                                     master_df, iteration=it)
         iteration_ledger['Iteration']  = it
