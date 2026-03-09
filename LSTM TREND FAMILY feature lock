@@ -1,0 +1,679 @@
+# SOVEREIGN TITAN v3.19.18 — GPU + SPEED EDITION v2
+# Speed changes vs prior version:
+#   1. Parallel yfinance downloads       (ThreadPoolExecutor)
+#   2. Sequences built ONCE per iter     (was rebuilt 150× per feature)
+#   3. Single model + perm-importance    (1 train + 150 forward passes vs 150 trains)
+#   4. tf.data pipeline with prefetch    (GPU never idles waiting for CPU)
+#   5. @tf.function on eval step         (JIT-compiles permutation scoring)
+# ── NEW IN THIS VERSION ──────────────────────────────────────────────────────
+#   6. ALL rolling functions JIT-compiled via Numba  (no more Python lambdas)
+#      _lin_slope, _hurst, _cog, _shannon, _r_sq, _wma — all native machine code
+#   7. ProcessPoolExecutor for feature generation    (true multi-core, bypasses GIL)
+#   8. Duplicate linreg/slope computation removed
+#   9. Dispersion vectorised (np.stack instead of Python list comprehension)
+#  10. BRAIN_LOCKS names corrected to match actual column output
+# ==============================================================================
+# ### BLOCK 0: GPU SETUP
+# ==============================================================================
+import os, gc, warnings
+warnings.filterwarnings('ignore')
+import tensorflow as tf
+
+def setup_gpu():
+    gpus = tf.config.list_physical_devices('GPU')
+    if not gpus:
+        print("⚠️  No GPU — running CPU. Colab: Runtime → Change runtime type → T4 GPU")
+        return False
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    tf.keras.mixed_precision.set_global_policy('mixed_float16')
+    print(f"✅ Mixed precision: {tf.keras.mixed_precision.global_policy().name}")
+    with tf.device('/device:GPU:0'):
+        _ = tf.random.normal((10, 10)) @ tf.random.normal((10, 10))
+    print(f"✅ GPU confirmed: {tf.test.gpu_device_name()}")
+    return True
+
+GPU_AVAILABLE = setup_gpu()
+DEVICE = '/device:GPU:0' if GPU_AVAILABLE else '/cpu:0'
+print(f"[SYSTEM] Active compute device: {DEVICE}\n")
+
+
+# ==============================================================================
+# ### BLOCK 1: SYSTEM INITIALIZATION
+# ==============================================================================
+import numpy as np, pandas as pd, yfinance as yf
+import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import GRU, LSTM, Dense, Input, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.preprocessing import RobustScaler
+from sklearn.decomposition import PCA
+from tqdm.auto import tqdm
+import random
+from numba import jit
+from datetime import datetime
+from google.colab import drive
+
+if not os.path.exists('/content/drive'):
+    drive.mount('/content/drive', force_remount=True)
+
+TEST_NAME        = "Sovereign_Titan_v3.19.18_Entropy_Injection"
+OUTPUT_DRIVE_DIR = f'/content/drive/MyDrive/judicial_results/{TEST_NAME}/'
+if not os.path.exists(OUTPUT_DRIVE_DIR):
+    os.makedirs(OUTPUT_DRIVE_DIR)
+
+# Number of CPU workers for feature generation
+# Colab free = 2, Colab Pro = 4-8. Auto-detects.
+N_FEATURE_WORKERS = max(1, (os.cpu_count() or 2))
+print(f"[SYSTEM] Feature generation workers: {N_FEATURE_WORKERS}")
+
+TITAN_SYMBOLS = [
+    'AA','AAL','AAPL','ABNB','ACWI','AEM','AFRM','AI','ALAB','ALB','AMAT','AMD','AMZN',
+    'ANET','APA','APH','ARKK','AVGO','BA','BABA','BAC','BKR','BLDR','C','CARR','CAT',
+    'CCJ','CCL','CE','CELH','CLF','CLSK','CMG','CNC','CPRT','CRM','CSCO','CSX','CVS',
+    'CVX','DAL','DDOG','DHR','DIA','DIS','DKNG','DLTR','DOW','DVN','DXCM','EA','EBAY',
+    'EEM','EMR','EQT','EWJ','EWT','EWW','EWY','EWZ','EXC','F','FANG','FCX','FITB',
+    'FTNT','FTV','FXI','GBTC','GDX','GDXJ','GEHC','GFS','GIS','GOOG','GOOGL','GS',
+    'HAL','HOOD','HPE','HPQ','HWM','IAU','IBM','IGV','IJH','IJR','INTC','IP','IR',
+    'IWM','IYR','JNJ','KDP','KMI','KO','KRE','KWEB','LOW','LRCX','LUV','LVS','LYFT',
+    'MAR','MARA','MCHP','MGM','MNST','MPC','MRK','MRNA','MRVL','MS','MSFT','MSTR',
+    'MU','NCLH','NEE','NEM','NKE','NUE','NVDA','NVO','NXPI','ON','ORCL','OXY','PANW',
+    'PCAR','PDD','PEP','PFE','PINS','PLTR','PYPL','QCOM','QQQ','QQQM','RBLX','RIOT',
+    'RIVN','RTX','SBUX','SCHW','SHOP','SJM','SLB','SLV','SMCI','SMH','SNAP','SNOW',
+    'SOFI','SOXX','SPLG','SPY','TER','TGT','TJX','TLT','TMUS','TQQQ','TSCO','TSLA',
+    'TTD','TTWO','TWLO','TXN','U','UAL','UBER','UPS','USB','USO','VLO','VNQ','VRT',
+    'VST','VT','VTR','WMT','WYNN','XBI','XLB','XLC','XLE','XLF','XLI','XLK','XLP',
+    'XLRE','XLU','XLV','XLY','XOM','XOP','XRT'
+]
+
+
+# ==============================================================================
+# ### BLOCK 2: NUMBA JIT ROLLING KERNELS (v4.5)
+# ==============================================================================
+import numpy as np
+from numba import jit
+
+@jit(nopython=True, cache=True)
+def _lin_slope_nb(y):
+    n = len(y)
+    if n < 2: return 0.0
+    x_m = (n - 1) / 2.0
+    y_m = 0.0
+    for i in range(n): y_m += y[i]
+    y_m /= n
+    num = 0.0; den = 0.0
+    for i in range(n):
+        dx = i - x_m
+        num += dx * (y[i] - y_m)
+        den += dx * dx
+    return num / den if den != 0.0 else 0.0
+
+@jit(nopython=True, cache=True)
+def _rolling_linslope(arr, window):
+    n = len(arr); out = np.full(n, 0.0)
+    for i in range(window - 1, n):
+        out[i] = _lin_slope_nb(arr[i - window + 1 : i + 1])
+    return out
+
+@jit(nopython=True, cache=True)
+def _rolling_shannon(arr, window):
+    n = len(arr); out = np.full(n, 0.0); bins = 10
+    for i in range(window - 1, n):
+        y = arr[i - window + 1 : i + 1]
+        mn, mx = np.min(y), np.max(y)
+        if mx == mn: continue
+        counts = np.zeros(bins)
+        for val in y:
+            b_idx = int((val - mn) / (mx - mn + 1e-9) * bins)
+            counts[min(b_idx, bins-1)] += 1
+        ent = 0.0
+        for c in counts:
+            p = c / window + 1e-9
+            ent -= p * np.log(p)
+        out[i] = ent
+    return out
+
+@jit(nopython=True, cache=True)
+def _rolling_r_sq(y, window):
+    n = len(y); out = np.full(n, 0.0)
+    for i in range(window - 1, n):
+        slice_y = y[i - window + 1 : i + 1]
+        x = np.arange(window, dtype=np.float64)
+        x_m = (window - 1) / 2.0
+        y_m = np.mean(slice_y)
+        num = 0.0; den_x = 0.0; den_y = 0.0
+        for j in range(window):
+            dx = x[j] - x_m
+            dy = slice_y[j] - y_m
+            num += dx * dy
+            den_x += dx * dx
+            den_y += dy * dy
+        if den_x > 0 and den_y > 0:
+            r = num / (np.sqrt(den_x) * np.sqrt(den_y))
+            out[i] = r * r
+    return out
+
+@jit(nopython=True, cache=True)
+def _rolling_hurst(y, window):
+    n = len(y); out = np.full(n, 0.5)
+    for i in range(window - 1, n):
+        slice_y = y[i - window + 1 : i + 1]
+        std = np.std(slice_y)
+        if std > 1e-12:
+            out[i] = np.log(std + 1e-9) / np.log(window)
+    return out
+
+@jit(nopython=True, cache=True)
+def _vidya_numba(price, alpha_cmo):
+    n = len(price); out = np.full(n, price[0])
+    for i in range(1, n):
+        a = abs(alpha_cmo[i])
+        out[i] = a * price[i] + (1 - a) * out[i-1]
+    return out
+
+@jit(nopython=True, cache=True)
+def _kalman_numba(price, r=0.0001, q=0.001):
+    x_hat = np.zeros_like(price); p = np.zeros_like(price)
+    x_hat[0] = price[0]; p[0] = 1.0
+    for t in range(1, len(price)):
+        p_minus = p[t-1] + q
+        k = p_minus / (p_minus + r)
+        x_hat[t] = x_hat[t-1] + k * (price[t] - x_hat[t-1])
+        p[t] = (1 - k) * p_minus
+    return x_hat
+
+@jit(nopython=True, cache=True)
+def _hilbert_itrend_nb(price, alpha=0.07):
+    n = len(price); it = np.zeros(n)
+    for i in range(7, n):
+        it[i] = (alpha - alpha**2/4)*price[i] + 0.5*alpha**2*price[i-1] - (alpha - 0.75*alpha**2)*price[i-2] + 2*(1-alpha)*it[i-1] - (1-alpha)**2*it[i-2]
+    return it
+
+@jit(nopython=True, cache=True)
+def _fast_fe(hi, lo, tr, window):
+    n = len(hi); out = np.full(n, 1.0)
+    for i in range(window - 1, n):
+        h = np.max(hi[i-window+1:i+1])
+        l = np.min(lo[i-window+1:i+1])
+        sum_tr = np.sum(tr[i-window+1:i+1])
+        if sum_tr > 0:
+            out[i] = (h - l) / sum_tr
+    return out
+
+@jit(nopython=True, cache=True)
+def _directional_persistence_nb(cl, window):
+    n = len(cl); out = np.full(n, 0.0)
+    for i in range(window, n):
+        diffs = np.diff(cl[i-window:i+1])
+        pos = np.sum(diffs > 0)
+        out[i] = pos / window
+    return out
+# ==============================================================================
+# ### BLOCK 3: FEATURE FACTORY (v4.5 - SOS INTEGRATION)
+# ==============================================================================
+def generate_factory_features_v2(df):
+    if len(df) < 250: return pd.DataFrame()
+
+    df = df.copy()
+    idx = df.index
+    df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
+    df['T_FINAL'] = np.where(df['close'].shift(-1) > df['close'], 1, 0)
+
+    hi, lo, cl = df['high'].values, df['low'].values, df['close'].values
+    hlc = df['hlc3'].values.astype(np.float64)
+    cl_p = np.roll(cl, 1); cl_p[0] = cl[0]
+    tr = np.maximum(hi-lo, np.maximum(np.abs(hi-cl_p), np.abs(lo-cl_p)))
+
+    # --- PRICE-RELATIVE FAMILY ---
+    ema30 = pd.Series(hlc).ewm(span=30).mean().values
+    tema_30 = 3*ema30 - 3*pd.Series(ema30).ewm(span=30).mean().values + pd.Series(pd.Series(pd.Series(ema30).ewm(span=30).mean().values).ewm(span=30).mean().values).ewm(span=30).mean().values
+    sma_20 = pd.Series(hlc).rolling(20).mean().values
+    kalman = _kalman_numba(hlc)
+    hilbert = _hilbert_itrend_nb(hlc)
+
+    cmo_20 = (pd.Series(hlc).diff().rolling(20).sum() / (pd.Series(hlc).diff().abs().rolling(20).sum() + 1e-9)).values
+    vidya_20 = _vidya_numba(hlc, cmo_20)
+
+    # --- GEOMETRY & COMPLEXITY ---
+    er_20 = (pd.Series(hlc).diff(20).abs() / (pd.Series(hlc).diff().abs().rolling(20).sum() + 1e-9)).values
+    r_sq_30 = _rolling_r_sq(hlc, 30)
+    hurst_50 = _rolling_hurst(hlc, 50)
+    shan_20 = _rolling_shannon(hlc, 20)
+    fe_10 = _fast_fe(hi, lo, tr, 10)
+    fe_30 = _fast_fe(hi, lo, tr, 30)
+    linreg_30 = _rolling_linslope(hlc, 30)
+    logistic_prob_30 = 1.0 / (1.0 + np.exp(-linreg_30 / (np.nanstd(linreg_30) + 1e-9)))
+
+    # Dispersion (Inter-MA spread)
+    d_sma, d_tema, d_kal = hlc/sma_20-1, hlc/tema_30-1, hlc/kalman-1
+    dispersion_30 = np.std(np.stack([d_sma, d_tema, d_kal], axis=1), axis=1)
+
+    Z_LENS_SEEDS = {
+        'tema_30_pct': pd.Series(hlc/tema_30-1, index=idx),
+        'sma_20_pct': pd.Series(hlc/sma_20-1, index=idx),
+        'kalman_pct': pd.Series(hlc/kalman-1, index=idx),
+        'vidya_pct': pd.Series(hlc/vidya_20-1, index=idx),
+        'hilbert_pct': pd.Series(hlc/hilbert-1, index=idx),
+        'er_20': pd.Series(er_20, index=idx),
+        'vidya_cmo_20': pd.Series(cmo_20, index=idx),
+        'r_sq_30': pd.Series(r_sq_30, index=idx),
+        'hurst_50': pd.Series(hurst_50, index=idx),
+        'shannon_20': pd.Series(shan_20, index=idx),
+        'logistic_prob_30': pd.Series(logistic_prob_30, index=idx),
+        'lr_slope_30': pd.Series(linreg_30, index=idx),
+        'dispersion_30': pd.Series(dispersion_30, index=idx),
+        'fe_10': pd.Series(fe_10, index=idx),
+        'fe_ratio': pd.Series(fe_10 / (fe_30 + 1e-9), index=idx),
+        'shan_ratio': pd.Series(shan_20 / (pd.Series(shan_20).rolling(40).mean() + 1e-9), index=idx),
+        'rsq_er_ratio': pd.Series(r_sq_30 / (er_20 + 1e-9), index=idx),
+        'dir_persist_20': pd.Series(_directional_persistence_nb(cl, 20), index=idx),
+        'donchian_high_50': pd.Series(hi / pd.Series(hi).rolling(50).max() - 1, index=idx)
+    }
+
+    for name, s in Z_LENS_SEEDS.items():
+        arr = s.values.astype(np.float64)
+        for lens in [10, 90]:
+            roll = pd.Series(arr).rolling(lens)
+            z = (arr - roll.mean().values) / (roll.std().values + 1e-9)
+            df[f'LENS_{lens}_{name}_z'] = z
+            slope = _rolling_linslope(z, lens)
+            df[f'LENS_{lens}_{name}_z_slope'] = slope
+            df[f'LENS_{lens}_{name}_z_sos'] = _rolling_linslope(slope, lens)
+
+    df = df.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
+    return df.dropna(subset=['T_FINAL'])
+# ==============================================================================
+# ### BLOCK 4: PARALLEL LOADER (FIXED TYPEERROR)
+# ==============================================================================
+def _process_symbol_worker(item):
+    """TOP-LEVEL WORKER: Required for ProcessPoolExecutor pickling."""
+    symbol, data_dict = item
+    try:
+        # Convert dict back to DataFrame
+        df = pd.DataFrame.from_dict(data_dict)
+        df.index = pd.to_datetime(df.index)
+
+        # Generate features
+        processed = generate_factory_features_v2(df)
+        if processed.empty: return None
+
+        # Keep track of which symbol this is
+        processed.insert(0, 'symbol', symbol)
+        return processed
+    except:
+        return None
+
+def fetch_data(symbol):
+    try:
+        data = yf.download(symbol, period="2y", interval="1d", progress=False, auto_adjust=True, multi_level_index=False)
+        if data.empty: return None
+        if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
+        data.columns = [str(c).lower() for c in data.columns]
+        return data if 'close' in data.columns else None
+    except:
+        return None
+
+def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
+    print(f"📥 Parallel yfinance API download: {len(symbol_list)} symbols...")
+    raw_results = {}
+    workers = int(dl_workers) if not isinstance(dl_workers, list) else 20
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        fut_map = {pool.submit(fetch_data, sym): sym for sym in symbol_list}
+        for fut in tqdm(as_completed(fut_map), total=len(symbol_list), desc="⬇ Downloading"):
+            sym = fut_map[fut]
+            data = fut.result()
+            if data is not None and len(data) >= 120:
+                raw_results[sym] = data
+
+    if not raw_results: return pd.DataFrame()
+
+    work_items = [(sym, df.to_dict()) for sym, df in raw_results.items()]
+    all_data = []
+
+    try:
+        # Now _process_symbol_worker is defined at the top level and can be pickled
+        with ProcessPoolExecutor(max_workers=int(N_FEATURE_WORKERS)) as pool:
+            futures = {pool.submit(_process_symbol_worker, item): item[0] for item in work_items}
+            for fut in tqdm(as_completed(futures), total=len(work_items), desc="⚙ Features"):
+                res = fut.result()
+                if res is not None:
+                    res = res.set_index(res.columns[0])
+                    all_data.append(res)
+    except Exception as e:
+        print(f"  ⚠️ ProcessPool Fallback: {e}")
+        for item in work_items:
+            res = _process_symbol_worker(item)
+            if res is not None:
+                all_data.append(res.set_index(res.columns[0]))
+
+    return pd.concat(all_data, axis=0) if all_data else pd.DataFrame()
+# ==============================================================================
+# ### UPDATED CALLING SITE
+# ==============================================================================
+# Ensure BRAIN is a string and POOL is a list.
+# Current: TITAN v3.19.18 defaults to 1-day horizon per your protocol.
+BRAIN = "DIRECTION"
+POOL = random.sample(TITAN_SYMBOLS, min(10, len(TITAN_SYMBOLS)))
+
+master_df = load_hybrid_data_parallel(BRAIN, POOL)
+
+
+# ==============================================================================
+# ### BLOCK 5: GPU-ACCELERATED AUDIT — single model + permutation importance
+# ==============================================================================
+def build_full_model(model_type, n_features, seq_len, device=DEVICE):
+    with tf.device(device):
+        model = Sequential([
+            Input(shape=(seq_len, n_features)),
+            GRU(128, return_sequences=True)  if model_type == 'GRU' else
+            LSTM(128, return_sequences=True),
+            Dropout(0.2),
+            GRU(64)  if model_type == 'GRU' else LSTM(64),
+            Dropout(0.2),
+            Dense(32, activation='relu'),
+            Dense(1, activation='sigmoid', dtype='float32')
+        ])
+        model.compile(optimizer=Adam(1e-3),
+                      loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+
+@tf.function
+def _eval_accuracy(model, X_batch, y_batch):
+    preds   = tf.squeeze(model(X_batch, training=False), axis=-1)
+    correct = tf.equal(tf.cast(preds >= 0.5, tf.int32), tf.cast(y_batch, tf.int32))
+    return tf.reduce_mean(tf.cast(correct, tf.float32))
+
+
+def run_judicial_audit(brain_name, master_df, model_type='GRU',
+                       seq_len=10, epochs=8, batch_size=1024):
+    feature_cols = [c for c in master_df.columns if c.startswith('LENS_') or c.startswith('WIN_')]
+    n_features   = len(feature_cols)
+
+    scaler   = RobustScaler()
+    X_scaled = scaler.fit_transform(master_df[feature_cols].values).astype(np.float32)
+    y_raw    = master_df['T_FINAL'].values.astype(np.float32)
+
+    n      = len(X_scaled)
+    X_seqs = np.stack([X_scaled[i-seq_len:i] for i in range(seq_len, n)])
+    y_seqs = y_raw[seq_len:]
+
+    split        = int(len(X_seqs) * 0.8)
+    X_tr, X_val  = X_seqs[:split], X_seqs[split:]
+    y_tr, y_val  = y_seqs[:split], y_seqs[split:]
+
+    print(f"  [DATA] train={len(X_tr):,}  val={len(X_val):,}  features={n_features}")
+
+    AUTO = tf.data.AUTOTUNE
+    train_ds = (tf.data.Dataset.from_tensor_slices((X_tr, y_tr))
+                .shuffle(min(20_000, len(X_tr)), reshuffle_each_iteration=True)
+                .batch(batch_size).prefetch(AUTO))
+    val_ds   = (tf.data.Dataset.from_tensor_slices((X_val, y_val))
+                .batch(batch_size * 2).prefetch(AUTO))
+
+    model = build_full_model(model_type, n_features, seq_len)
+
+    with tf.device(DEVICE):
+        model.fit(train_ds, validation_data=val_ds, epochs=epochs,
+                  callbacks=[EarlyStopping(monitor='val_loss', patience=6,
+                                           restore_best_weights=True),
+                             ReduceLROnPlateau(monitor='val_loss', factor=0.5,
+                                              patience=3, min_lr=1e-5)],
+                  verbose=1)
+
+    X_val_tf     = tf.constant(X_val)
+    y_val_tf     = tf.constant(y_val)
+    baseline_acc = _eval_accuracy(model, X_val_tf, y_val_tf).numpy()
+    print(f"  [MODEL] Baseline val accuracy: {baseline_acc:.4f}")
+
+    report_rows = []
+    for fi, feat_name in enumerate(tqdm(feature_cols, desc="Permutation scoring")):
+        try:
+            X_perm = X_val.copy()
+            flat   = X_perm[:, :, fi].flatten()
+            np.random.shuffle(flat)
+            X_perm[:, :, fi] = flat.reshape(X_perm[:, :, fi].shape)
+            perm_acc = _eval_accuracy(model, tf.constant(X_perm), y_val_tf).numpy()
+            report_rows.append({'Feature': feat_name,
+                                 'I_raw': max(0.0, baseline_acc - perm_acc)})
+        except:
+            report_rows.append({'Feature': feat_name, 'I_raw': 0.0})
+
+    del model; gc.collect(); tf.keras.backend.clear_session()
+    return pd.DataFrame(report_rows)
+
+
+# ==============================================================================
+# ### BLOCK 6: SOVEREIGN HUNT & DIVERSITY ANCHORS
+# BRAIN_LOCKS corrected to match actual factory column names
+# ==============================================================================
+BRAIN_LOCKS = {
+    'DIRECTION': [],
+    'EASE':      [],
+    'EXP':       []
+}
+# Bounded indicators:   LENS_{10|90}_{name}_{z|z_slope|z_sos}
+# Unbounded indicators: WIN_{10|30|90}_{name}_pct
+
+
+def _parse_feature_name(f):
+    """
+    Splits a LENS_ or WIN_ feature name into components.
+
+    LENS_10_cog_20_z_slope  -> prefix='LENS', window='10', lookback='LENS_10_cog_20', family='cog'
+    LENS_90_cog_20_z        -> prefix='LENS', window='90', lookback='LENS_90_cog_20', family='cog'
+    WIN_10_cog_20_pct       -> prefix='WIN',  window='10', lookback='WIN_10_cog_20',  family='cog'
+
+    RULE (same for LENS and WIN):
+      - Only ONE window per family is allowed in the final 19.
+        LENS_10 vs LENS_90 of cog_20 are competing — hunt picks the higher-impact one.
+      - All three transforms of the winning window CAN coexist:
+        LENS_10_cog_20_z, LENS_10_cog_20_z_slope, LENS_10_cog_20_z_sos share
+        the same lookback key ('LENS_10_cog_20') so they don't block each other.
+    """
+    TRANSFORM_TOKENS = {'z', 'slope', 'sos', 'pct'}
+
+    if f.startswith('LENS_') or f.startswith('WIN_'):
+        parts     = f.split('_')
+        prefix    = parts[0]
+        window    = parts[1]
+        remainder = list(parts[2:])
+
+        while remainder and remainder[-1] in TRANSFORM_TOKENS:
+            remainder.pop()
+
+        indicator = '_'.join(remainder)
+        family    = '_'.join(p for p in remainder if not p.isdigit())
+
+        # For BOTH LENS and WIN: window is a competing choice.
+        # Fold prefix+window into lookback so the family rule enforces
+        # "only one window per indicator" in the hunt.
+        # The three transforms (z, z_slope, z_sos) of the winning window
+        # share the same lookback key and can all enter freely.
+        lookback = f'{prefix}_{window}_{indicator}'
+
+        return prefix, window, lookback, family
+
+    return None, None, f, f
+
+
+def apply_sovereign_hunt(ledger_df, master_data_df, brain_name, max_slots=19):
+    from collections import Counter
+    locked_list  = BRAIN_LOCKS.get(brain_name, [])
+    candidates   = ledger_df.sort_values(by='I_raw', ascending=False)
+    picked       = [f for f in locked_list if f in ledger_df['Feature'].values]
+
+    # Warn loudly if a locked feature is missing — easier to catch than silent skip
+    for lf in locked_list:
+        if lf not in ledger_df['Feature'].values:
+            print(f"  ⚠️  BRAIN_LOCK '{lf}' not found in feature columns — check name")
+
+    CORR_THRESHOLD = 0.85
+
+    # Track which LOOKBACK is in use per FAMILY (not a count — a specific value)
+    # e.g. family_lookback['cog'] = 'cog_20'  → blocks 'cog_30' but not more 'cog_20' lenses
+    family_lookback = {}
+    for f in picked:
+        _, _, lookback, family = _parse_feature_name(f)
+        if family not in family_lookback:
+            family_lookback[family] = lookback
+
+    # Corr matrix covers both LENS_ and WIN_ columns
+    feat_cols   = [c for c in master_data_df.columns if c.startswith('LENS_') or c.startswith('WIN_')]
+    corr_matrix = master_data_df[feat_cols].corr()
+
+    for _, row in candidates.iterrows():
+        if len(picked) >= max_slots: break
+        f_name    = row['Feature']
+        f_impact  = row['I_Norm']
+        if f_name in picked: continue
+
+        _, _, f_lookback, f_family = _parse_feature_name(f_name)
+
+        # Block if this family already has a DIFFERENT lookback committed
+        if f_family in family_lookback and family_lookback[f_family] != f_lookback:
+            continue
+
+        # Correlation guard
+        if len(picked) > 0 and corr_matrix[f_name].loc[picked].max() > CORR_THRESHOLD:
+            continue
+
+        picked.append(f_name)
+        if f_family not in family_lookback:
+            family_lookback[f_family] = f_lookback
+
+    pca = PCA()
+    pca.fit(RobustScaler().fit_transform(master_data_df[picked]))
+    return picked, np.cumsum(pca.explained_variance_ratio_)
+
+
+def generate_judicial_ledger(brain_name, report_df, master_data_df, iteration=1):
+    df = report_df.copy()
+    df['I_Norm']          = (df['I_raw'] - df['I_raw'].min()) / \
+                            (df['I_raw'].max() - df['I_raw'].min() + 1e-9)
+    active_picks, var_map = apply_sovereign_hunt(df, master_data_df, brain_name)
+    corr_sub = master_data_df[active_picks].corr().abs()
+    avg_corr = (corr_sub.sum().sum() - len(active_picks)) / \
+               (len(active_picks)**2 - len(active_picks) + 1e-9)
+
+    print(f"\n╔══ {brain_name} SOVEREIGN CORE V.3.19.18 (Iter {iteration}) ══╗")
+    print(f"║ {'RNK':<3} | {'TREND FEATURE':<35} | {'UV%':<4} | {'mR':<4} | {'IMPACT':<8} ║")
+    print("╠" + "═"*4 + "╬" + "═"*37 + "╬" + "═"*6 + "╬" + "═"*6 + "╬" + "═"*10 + "╣")
+
+    for i, f_name in enumerate(active_picks):
+        f_row       = df[df['Feature'] == f_name].iloc[0]
+        is_locked   = f_name in BRAIN_LOCKS.get(brain_name, [])
+        icon        = "🔒" if is_locked else "🔭"
+        lb_val      = f_name.split('_')[1] if (f_name.startswith('LENS_') or f_name.startswith('WIN_')) else "??"
+        other_picks = [p for p in active_picks if p != f_name]
+        max_r  = corr_sub[f_name].loc[other_picks].max() if other_picks else 0.0
+        uv_val = (1 - corr_sub[f_name].loc[other_picks].mean()) * 100 if other_picks else 100.0
+        print(f"║ {i+1:02d}  | {icon} {f_name[:33]:<33} | {uv_val:>3.0f}% | {max_r:.2f} | {f_row['I_Norm']:.4f} ║")
+        df.loc[df['Feature'] == f_name, ['UV%','Max_R','LB','Is_Locked']] = \
+            [uv_val, max_r, lb_val, is_locked]
+
+    total_var = var_map[-1] if len(var_map) > 0 else 0
+    print("╠" + "═"*73 + "╣")
+    print(f"║ PCA TOTAL VARIANCE RETENTION: {total_var*100:>33.2f}% ║")
+    print(f"║ AVG TEAM CROSS-CORRELATION: {avg_corr:>35.3f} ║")
+    print(f"║ SLOTS FILLED: {len(active_picks):>44}/19 ║")
+    print("╚" + "═"*73 + "╝")
+    return df[df['Feature'].isin(active_picks)]
+
+
+# ==============================================================================
+# ### BLOCK 7: COMMAND CENTER
+# ==============================================================================
+print("\n--- SOVEREIGN TITAN v3.19.18 — GPU + SPEED EDITION v2 ---")
+choice        = input("Select Brain (1:DIR / 2:EASE / 3:EXP / 4:ALL): ")
+BRAINS_TO_RUN = ['DIRECTION','EASE','EXP'] if choice == '4' else \
+                [{'1':'DIRECTION','2':'EASE','3':'EXP'}[choice]]
+num_symbols   = int(input("Symbols per iteration (Default 50): ") or "50")
+num_iters     = int(input("Iterations to run (Default 25): ")     or "25")
+
+final_report_accumulator = []
+
+for BRAIN in BRAINS_TO_RUN:
+    CURRENT_MODEL_TYPE = 'GRU' if BRAIN == 'DIRECTION' else 'LSTM'
+    print(f"\n[SYSTEM] Brain: {BRAIN} | Model: {CURRENT_MODEL_TYPE} | Device: {DEVICE}")
+
+    for it in range(1, num_iters + 1):
+        print(f"\n{'─'*55}")
+        print(f"  Iteration {it}/{num_iters}  —  Brain: {BRAIN}")
+        print(f"{'─'*55}")
+
+        POOL      = random.sample(TITAN_SYMBOLS, min(num_symbols, len(TITAN_SYMBOLS)))
+        master_df = load_hybrid_data_parallel(BRAIN, POOL)
+        if master_df.empty:
+            print("  ⚠️  Empty master_df — skipping.")
+            continue
+
+        report_raw       = run_judicial_audit(BRAIN, master_df, model_type=CURRENT_MODEL_TYPE)
+        iteration_ledger = generate_judicial_ledger(BRAIN, report_raw, master_df, iteration=it)
+
+        iteration_ledger['Iteration']  = it
+        iteration_ledger['Brain']      = BRAIN
+        iteration_ledger['Model_Type'] = CURRENT_MODEL_TYPE
+        iteration_ledger['Timestamp']  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        final_report_accumulator.append(iteration_ledger)
+
+        gc.collect()
+        tf.keras.backend.clear_session()
+
+
+# ==============================================================================
+# ### BLOCK 8: FINAL EXPORT & SOVEREIGN SELECTION
+# ==============================================================================
+if final_report_accumulator:
+    raw_df = pd.concat(final_report_accumulator, axis=0)
+
+    stats = (raw_df.groupby(['Brain','Feature'])
+             .agg(Persistence=('Feature','count'),
+                  A_Impact=('I_Norm','mean'),
+                  A_UV=('UV%','mean'))
+             .reset_index())
+
+    final_df = (raw_df.merge(stats, on=['Brain','Feature'], how='left')
+                      .sort_values(['Brain','Persistence','A_Impact'], ascending=False))
+
+    report_filename = f"Sovereign_Audit_Master_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    report_path     = os.path.join(OUTPUT_DRIVE_DIR, report_filename)
+    final_df.to_csv(report_path, index=False)
+
+    print("\n" + "="*65)
+    print("✅ GLOBAL AUDIT COMPLETE")
+    print(f"📊 DATA ROWS COLLECTED: {len(raw_df)}")
+    print(f"📂 CSV SAVED TO:        {report_path}")
+    print("="*65)
+
+    print("\n" + "═"*65)
+    print("🚀 FINAL SOVEREIGN ARRAYS (TOP 19 PER BRAIN)")
+    print("═"*65)
+    FINAL_SELECTIONS = {}
+
+    for brain in BRAINS_TO_RUN:
+        brain_stats = (stats[stats['Brain'] == brain]
+                       .sort_values(['Persistence','A_Impact'], ascending=False))
+        top_19      = brain_stats.head(19)
+        FINAL_SELECTIONS[brain] = top_19['Feature'].tolist()
+
+        print(f"\n💎 FINAL 19 — BRAIN: {brain}")
+        print(f"{'RNK':<3} | {'FEATURE':<38} | {'PERSIST':<8} | {'AVG_IMP':<8}")
+        print("─" * 62)
+        for i, row in top_19.reset_index(drop=True).iterrows():
+            print(f"{i+1:02d}  | {row['Feature']:<38} | "
+                  f"{int(row['Persistence']):>2}/{num_iters:<5} | {row['A_Impact']:.4f}")
+
+    for brain, winners in FINAL_SELECTIONS.items():
+        BRAIN_LOCKS[brain] = winners
+
+    print("\n" + "═"*65)
+    print("✅ FINAL 19 SYNCED TO BRAIN_LOCKS")
+    print(f"📂 TOTAL UNIQUE FEATURES LOGGED: {len(stats)}")
+    print("═"*65)
+
+else:
+    print("\n⚠️ [CRITICAL] No data collected. Audit failed.")
