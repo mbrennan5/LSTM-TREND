@@ -741,7 +741,7 @@ def apply_sovereign_hunt(ledger_df, master_data_df, brain_name, max_slots=19):
         if lf not in ledger_df['Feature'].values:
             print(f"  ⚠️  BRAIN_LOCK '{lf}' not found — check name")
 
-    CORR_THRESHOLD = 0.65
+    CORR_THRESHOLD = 0.75
     # Track which lookback is committed per family
     # e.g. family_lookback['cog'] = 'LENS_10_cog_20'
     # → blocks 'LENS_90_cog_20' but not more LENS_10_cog_20 transforms
@@ -755,7 +755,6 @@ def apply_sovereign_hunt(ledger_df, master_data_df, brain_name, max_slots=19):
                    if c.startswith('LENS_') or c.startswith('WIN_')]
     corr_matrix = master_data_df[feat_cols].corr()
 
-    cur_n95 = 1  # PCA diversity gate: track n_for_95 as picks accumulate
     for _, row in candidates.iterrows():
         if len(picked) >= max_slots:
             break
@@ -768,16 +767,6 @@ def apply_sovereign_hunt(ledger_df, master_data_df, brain_name, max_slots=19):
         if (len(picked) > 0 and
                 corr_matrix[f_name].loc[picked].max() > CORR_THRESHOLD):
             continue
-        # Fix 3: PCA diversity gate — only accept if candidate raises n_for_95
-        trial = picked + [f_name]
-        if len(trial) >= 2:
-            _pca = PCA()
-            _pca.fit(RobustScaler().fit_transform(master_data_df[trial]))
-            _cumvar = np.cumsum(_pca.explained_variance_ratio_)
-            _n95 = int(np.searchsorted(_cumvar, 0.95)) + 1
-            if _n95 <= cur_n95:
-                continue  # no PCA diversity gain — skip this candidate
-            cur_n95 = _n95
         picked.append(f_name)
         if f_family not in family_lookback:
             family_lookback[f_family] = f_lookback
