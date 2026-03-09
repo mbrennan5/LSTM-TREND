@@ -512,26 +512,61 @@ def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
     return pd.concat(all_data, axis=0)
 
 # ==============================================================================
-# ### BLOCK 5: GPU-ACCELERATED AUDIT
-# Single model + permutation importance
-# (1 train + N forward passes vs N separate trains)
+# ### BLOCK 5: GPU-ACCELERATED AUDIT  (v4.0 Plan-Aligned)
+# Two architecture changes vs prior version (per master_md5.md best practices):
+#   1. Fast Mode model [64, 32, 16]  — 100k → 25k params  (3-5x faster)
+#   2. Plan Step 9: PCA n_raw → 19  — compresses input before training
+#      Fit on train only (warmup excluded) — anti-leakage compliant.
+# Permutation importance: permutes raw scaled features, re-applies PCA each
+# pass — preserves LENS_/WIN_ feature-name granularity for Block 6 sovereign hunt.
 # ==============================================================================
-def build_full_model(model_type, n_features, seq_len, device=DEVICE):
+
+N_PCA_COMPONENTS = 19   # Plan: S1SFT target — 19 within-family champions
+
+def build_full_model(model_type, n_features, seq_len, output_mode='classify',
+                     device=DEVICE):
+    """
+    Fast Mode spec (plan §Model Configuration):
+      GPU:  GRU/LSTM(64 → 32) → Dense(16) → Dense(1)  ~25k params
+      CPU:  Conv1D(32 → 16) + GAP → Dense(16) → Dense(1)  ~8k params
+    output_mode: 'classify' → sigmoid + binary_crossentropy
+                 'regress'  → linear  + huber
+    """
+    from tensorflow.keras.layers import Conv1D, GlobalAveragePooling1D
+    out_act = 'sigmoid' if output_mode == 'classify' else 'linear'
+    loss_fn = ('binary_crossentropy' if output_mode == 'classify'
+               else tf.keras.losses.Huber())
+    metrics = ['accuracy'] if output_mode == 'classify' else ['mae']
+
     with tf.device(device):
-        model = Sequential([
-            Input(shape=(seq_len, n_features)),
-            GRU(128,  return_sequences=True) if model_type == 'GRU'
-                else LSTM(128, return_sequences=True),
-            Dropout(0.2),
-            GRU(64) if model_type == 'GRU' else LSTM(64),
-            Dropout(0.2),
-            Dense(32, activation='relu'),
-            Dense(1,  activation='sigmoid', dtype='float32'),
-        ])
-        model.compile(optimizer=Adam(1e-3),
-                      loss='binary_crossentropy',
-                      metrics=['accuracy'])
+        if GPU_AVAILABLE:
+            # ── Fast Mode GPU path (plan: [64, 32, 16]) ───────────────────────
+            model = Sequential([
+                Input(shape=(seq_len, n_features)),
+                GRU(64,  return_sequences=True) if model_type == 'GRU'
+                    else LSTM(64, return_sequences=True),
+                Dropout(0.2),
+                GRU(32) if model_type == 'GRU' else LSTM(32),
+                Dropout(0.2),
+                Dense(16, activation='relu'),
+                Dense(1,  activation=out_act, dtype='float32'),
+            ])
+        else:
+            # ── CPU path: Conv1D (~8k params, fast on CPU) ────────────────────
+            model = Sequential([
+                Input(shape=(seq_len, n_features)),
+                Conv1D(32, kernel_size=3, activation='relu', padding='same'),
+                Dropout(0.1),
+                Conv1D(16, kernel_size=3, activation='relu', padding='same'),
+                GlobalAveragePooling1D(),
+                Dense(16, activation='relu'),
+                Dropout(0.2),
+                Dense(1,  activation=out_act, dtype='float32'),
+            ])
+
+        model.compile(optimizer=Adam(1e-3), loss=loss_fn, metrics=metrics)
     return model
+
 
 @tf.function
 def _eval_accuracy(model, X_batch, y_batch):
@@ -540,13 +575,15 @@ def _eval_accuracy(model, X_batch, y_batch):
                        tf.cast(y_batch, tf.int32))
     return tf.reduce_mean(tf.cast(correct, tf.float32))
 
-WARMUP_ROWS = 350  # first N rows have unreliable indicator values — excluded from scaler fit
+
+WARMUP_ROWS = 350  # first N rows have unreliable indicator values — excluded from fits
 
 def run_judicial_audit(brain_name, master_df, model_type='GRU',
                        seq_len=30, epochs=20, batch_size=2048):
     feature_cols = [c for c in master_df.columns
                     if c.startswith('LENS_') or c.startswith('WIN_')]
-    n_features   = len(feature_cols)
+    n_raw   = len(feature_cols)
+    N_COMPS = min(N_PCA_COMPONENTS, n_raw)   # safety: can't exceed raw count
 
     X_raw = master_df[feature_cols].values
     y_raw = master_df['T_FINAL'].values.astype(np.float32)
@@ -557,20 +594,29 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
     train_end = int(n_seq * 0.70)
     val_end   = int(n_seq * 0.85)
 
-    # ── Scaler fit on training rows only, warmup rows excluded ────────────────
+    # ── Step 8 (Plan): RobustScaler, fit on training rows only ────────────────
     scaler = RobustScaler()
     scaler.fit(X_raw[WARMUP_ROWS : seq_len + train_end])
     X_scaled = scaler.transform(X_raw).astype(np.float32)
 
-    X_seqs = np.stack([X_scaled[i - seq_len:i] for i in range(seq_len, n)])
+    # ── Step 9 (Plan): PCA n_raw → 19, fit on training rows only ──────────────
+    pca = PCA(n_components=N_COMPS)
+    pca.fit(X_scaled[WARMUP_ROWS : seq_len + train_end])
+    X_pca         = pca.transform(X_scaled).astype(np.float32)
+    var_explained = pca.explained_variance_ratio_.sum()
+    print(f"  [PCA] {n_raw} raw → {N_COMPS} components "
+          f"| variance retained: {var_explained:.1%}")
+
+    # ── Build sequences from PCA-compressed data ───────────────────────────────
+    X_seqs = np.stack([X_pca[i - seq_len:i] for i in range(seq_len, n)])
     y_seqs = y_raw[seq_len:]
 
-    X_tr  = X_seqs[:train_end];  y_tr  = y_seqs[:train_end]
-    X_val = X_seqs[train_end:val_end]; y_val = y_seqs[train_end:val_end]
-    X_te  = X_seqs[val_end:];   y_te  = y_seqs[val_end:]
+    X_tr  = X_seqs[:train_end];         y_tr  = y_seqs[:train_end]
+    X_val = X_seqs[train_end:val_end];  y_val = y_seqs[train_end:val_end]
+    X_te  = X_seqs[val_end:];          y_te  = y_seqs[val_end:]
 
     print(f"  [DATA] train={len(X_tr):,}  val={len(X_val):,}  "
-          f"test={len(X_te):,}  features={n_features}")
+          f"test={len(X_te):,}  input=({seq_len}, {N_COMPS})")
 
     AUTO     = tf.data.AUTOTUNE
     train_ds = (tf.data.Dataset.from_tensor_slices((X_tr, y_tr))
@@ -579,15 +625,16 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
     val_ds   = (tf.data.Dataset.from_tensor_slices((X_val, y_val))
                 .batch(batch_size * 2).prefetch(AUTO))
 
-    model = build_full_model(model_type, n_features, seq_len)
+    # ── Fast Mode model: input is N_COMPS (19), not n_raw ─────────────────────
+    model = build_full_model(model_type, N_COMPS, seq_len)
     with tf.device(DEVICE):
         model.fit(
             train_ds, validation_data=val_ds, epochs=epochs,
             callbacks=[
-                EarlyStopping(monitor='val_loss', patience=6,
+                EarlyStopping(monitor='val_loss', patience=5,   # plan: 5
                               restore_best_weights=True),
                 ReduceLROnPlateau(monitor='val_loss', factor=0.5,
-                                  patience=3, min_lr=1e-5),
+                                  patience=3, min_lr=1e-6),     # plan: 1e-6
             ],
             verbose=1,
         )
@@ -611,14 +658,26 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
     if test_acc > 0.70 and baseline_acc > 0.70:
         print(f"  🚨 LEAKAGE WARNING: val={baseline_acc:.4f}, test={test_acc:.4f} — investigate!")
 
+    # ── Permutation importance: permute in RAW SCALED space, re-apply PCA ──────
+    # Permuting raw features (not PCA components) preserves LENS_/WIN_ feature-name
+    # granularity required by Block 6 sovereign hunt.
+    # X_scaled slice covering all val sequences: rows train_end … val_end+seq_len
+    val_raw_slice = X_scaled[train_end : val_end + seq_len]  # (val_rows+seq_len, n_raw)
+    n_val_rows    = val_end - train_end
+
     report_rows = []
     for fi, feat_name in enumerate(tqdm(feature_cols, desc="Permutation scoring")):
         try:
-            X_perm = X_val.copy()
-            flat   = X_perm[:, :, fi].flatten()
+            X_perm_raw = val_raw_slice.copy()
+            flat       = X_perm_raw[:, fi].flatten()
             np.random.shuffle(flat)
-            X_perm[:, :, fi] = flat.reshape(X_perm[:, :, fi].shape)
-            perm_acc = _eval_accuracy(model, tf.constant(X_perm), y_val_tf).numpy()
+            X_perm_raw[:, fi] = flat
+            # Re-project through PCA (scaler already applied upstream)
+            X_perm_pca  = pca.transform(X_perm_raw).astype(np.float32)
+            X_perm_seqs = np.stack([X_perm_pca[k : k + seq_len]
+                                    for k in range(n_val_rows)])
+            perm_acc = _eval_accuracy(
+                model, tf.constant(X_perm_seqs), y_val_tf).numpy()
             report_rows.append({
                 'Feature': feat_name,
                 'I_raw':   max(0.0, baseline_acc - perm_acc),
