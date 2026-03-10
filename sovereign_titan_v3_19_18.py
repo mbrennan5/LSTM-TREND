@@ -464,6 +464,24 @@ def fetch_data(symbol, period="6y"):
         return None
 
 def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
+    # ── Inline worker — defined here so it is always in scope regardless of
+    # whether blocks are run as separate notebook cells.  ThreadPoolExecutor
+    # does not pickle callables (same process), so nested functions are fine.
+    def _worker(args):
+        symbol, raw_dict = args
+        try:
+            raw_df = pd.DataFrame(raw_dict)
+            raw_df.index = pd.to_datetime(raw_df.index)
+            if len(raw_df) < 400:
+                return None
+            processed = generate_factory_features_v2(raw_df)
+            if processed.empty:
+                return None
+            processed['symbol'] = symbol
+            return processed.reset_index()
+        except Exception:
+            return None
+
     # DIRECTION needs 6y history; EASE/EXP need 4y
     period = "6y" if brain_name == "DIRECTION" else "4y"
     print(f"📥 Parallel download: {len(symbol_list)} symbols (period={period})...")
@@ -476,7 +494,7 @@ def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
                         desc="⬇ Downloading"):
             sym  = fut_map[fut]
             data = fut.result()
-            if data is not None and len(data) >= 400:   # spec: 400 raw rows minimum
+            if data is not None and len(data) >= 400:
                 raw_results[sym] = data
 
     print(f"   ✅ {len(raw_results)}/{len(symbol_list)} symbols fetched")
@@ -484,17 +502,14 @@ def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
         return pd.DataFrame()
 
     # ── Phase 2: parallel feature generation ──────────────────────────────────
-    # Use ThreadPoolExecutor: threads share the kernel namespace so
-    # _process_symbol_worker is always reachable.  ProcessPoolExecutor is
-    # excluded because Colab/Jupyter subprocesses cannot unpickle functions
-    # defined in __main__ (the notebook kernel) — guaranteed NameError.
+    # ThreadPoolExecutor only — ProcessPoolExecutor excluded because Colab/Jupyter
+    # subprocesses cannot unpickle __main__-scoped functions (guaranteed NameError).
     work_items = [(sym, df.to_dict()) for sym, df in raw_results.items()]
     all_data   = []
 
     print(f"⚙ Building features in parallel (workers={N_FEATURE_WORKERS})...")
     with ThreadPoolExecutor(max_workers=N_FEATURE_WORKERS) as pool:
-        futures = {pool.submit(_process_symbol_worker, item): item[0]
-                   for item in work_items}
+        futures = {pool.submit(_worker, item): item[0] for item in work_items}
         for fut in tqdm(as_completed(futures), total=len(work_items),
                         desc="⚙ Features"):
             result = fut.result()
