@@ -392,7 +392,270 @@ if N_ITERS > 1:
     plt.show()
 
 
-# %% [9] EXPORT FINAL ROSTERS TO CSV
+# %% [9] NEW TREND DIMENSIONS & RATIO FEATURES
+# ─────────────────────────────────────────────────────────────────────────────
+# 4 missing trend dimensions  +  Top-10 high-value ratios for LSTM inputs.
+# Requires a separate OHLCV CSV.  Set PRICE_CSV below, then run this cell.
+# ─────────────────────────────────────────────────────────────────────────────
+from scipy import signal as sp_signal
+from scipy.stats import linregress as _lr
+
+PRICE_CSV      = "/content/drive/MyDrive/price_data.csv"  # ← set your file
+PRICE_DATE_COL = "Date"
+PRICE_CLOSE_COL = "Close"
+PRICE_HIGH_COL  = "High"
+PRICE_LOW_COL   = "Low"
+
+# ── Feature engineering helpers ───────────────────────────────────────────────
+def _rolling_apply(series, window, func, raw=True):
+    return series.rolling(window).apply(func, raw=raw)
+
+def rolling_slope(s, w):
+    def _s(y):
+        x = np.arange(len(y))
+        return _lr(x, y).slope
+    return _rolling_apply(s, w, _s)
+
+def rolling_r2(s, w):
+    def _r(y):
+        x = np.arange(len(y))
+        return _lr(x, y).rvalue ** 2
+    return _rolling_apply(s, w, _r)
+
+def rolling_quad_curvature(s, w):
+    """Trend Dim 2 — quadratic fit coefficient 'a' in ax²+bx+c."""
+    def _q(y):
+        x = np.arange(len(y))
+        return np.polyfit(x, y, 2)[0]   # coefficient a
+    return _rolling_apply(s, w, _q)
+
+def rolling_spectral_power_ratio(s, w, low_frac=0.25):
+    """Trend Dim 3 (Ehlers) — low-freq energy fraction; high → trend dominant."""
+    def _spr(y):
+        f, pxx = sp_signal.periodogram(y - y.mean())
+        if pxx[1:].sum() == 0:
+            return np.nan
+        cut = max(1, int(len(f) * low_frac))
+        return pxx[1:cut + 1].sum() / pxx[1:].sum()
+    return _rolling_apply(s, w, _spr)
+
+def rolling_dominant_cycle(s, w):
+    """Trend Dim 3 — dominant cycle length (bars) from spectral peak."""
+    def _dc(y):
+        f, pxx = sp_signal.periodogram(y - y.mean())
+        if len(f) < 2:
+            return np.nan
+        peak = pxx[1:].argmax() + 1
+        return 1.0 / f[peak] if f[peak] > 0 else np.nan
+    return _rolling_apply(s, w, _dc)
+
+def regime_duration(s):
+    """Trend Dim 4 — consecutive bars in same direction (run length)."""
+    direction = np.sign(s.diff())
+    count, runs = 0.0, []
+    for d in direction:
+        if np.isnan(d) or d == 0:
+            count = 0.0
+        elif len(runs) == 0 or np.sign(count) == d:
+            count += d
+        else:
+            count = d
+        runs.append(count)
+    return pd.Series(runs, index=s.index)
+
+def efficiency_ratio(s, w):
+    direction  = (s - s.shift(w)).abs()
+    volatility = s.diff().abs().rolling(w).sum()
+    return direction / volatility.replace(0, np.nan)
+
+def hurst_exp(s, w, lags=10):
+    def _h(y):
+        rs_vals = []
+        for lag in range(2, lags + 1):
+            sub  = y[:lag]
+            dev  = np.cumsum(sub - sub.mean())
+            rng  = dev.max() - dev.min()
+            std  = sub.std()
+            if std > 0:
+                rs_vals.append(rng / std)
+        if len(rs_vals) < 2:
+            return np.nan
+        h, *_ = _lr(np.log(range(2, len(rs_vals) + 2)), np.log(rs_vals))
+        return h
+    return _rolling_apply(s, w, _h)
+
+def shannon_entropy(s, w, bins=10):
+    rets = s.pct_change()
+    def _ent(y):
+        counts, _ = np.histogram(y[~np.isnan(y)], bins=bins)
+        p = counts / (counts.sum() + 1e-12)
+        p = p[p > 0]
+        return -np.sum(p * np.log(p))
+    return _rolling_apply(rets, w, _ent)
+
+def tema(s, w):
+    e1 = s.ewm(span=w, adjust=False).mean()
+    e2 = e1.ewm(span=w, adjust=False).mean()
+    e3 = e2.ewm(span=w, adjust=False).mean()
+    return 3 * e1 - 3 * e2 + e3
+
+def kalman_price(s, q=1e-5, r=1e-3):
+    x, p, out = s.iloc[0], 1.0, []
+    for obs in s:
+        p_pred = p + q
+        k      = p_pred / (p_pred + r)
+        x      = x + k * (obs - x)
+        p      = (1 - k) * p_pred
+        out.append(x)
+    return pd.Series(out, index=s.index)
+
+def hma(s, w):
+    half = s.ewm(span=max(w // 2, 2), adjust=False).mean()
+    full = s.ewm(span=w,              adjust=False).mean()
+    return (2 * half - full).ewm(span=max(int(np.sqrt(w)), 2), adjust=False).mean()
+
+# ── Compute all new features ──────────────────────────────────────────────────
+try:
+    pf = pd.read_csv(PRICE_CSV, parse_dates=[PRICE_DATE_COL])
+    pf = pf.sort_values(PRICE_DATE_COL).reset_index(drop=True)
+    cl, hi, lo = pf[PRICE_CLOSE_COL], pf[PRICE_HIGH_COL], pf[PRICE_LOW_COL]
+    atr14 = (hi - lo).rolling(14).mean()   # simplified ATR
+
+    print(f"✅ Price data loaded: {len(pf):,} bars  ({pf[PRICE_DATE_COL].iloc[0].date()} → "
+          f"{pf[PRICE_DATE_COL].iloc[-1].date()})")
+
+    # ── Trend Dimension 2: Quadratic curvature ────────────────────────────────
+    pf["quad_curve_20"] = rolling_quad_curvature(cl, 20)
+    pf["quad_curve_50"] = rolling_quad_curvature(cl, 50)
+
+    # ── Trend Dimension 3: Spectral trend ─────────────────────────────────────
+    pf["spectral_power_ratio_50"] = rolling_spectral_power_ratio(cl, 50)
+    pf["dominant_cycle_50"]       = rolling_dominant_cycle(cl, 50)
+
+    # ── Trend Dimension 4: Regime duration ────────────────────────────────────
+    pf["regime_duration"] = regime_duration(cl)
+
+    # ── Building blocks for ratios ────────────────────────────────────────────
+    s10   = rolling_slope(cl, 10)
+    s30   = rolling_slope(cl, 30)
+    s50   = rolling_slope(cl, 50)
+    r2_30 = rolling_r2(cl, 30)
+    er20  = efficiency_ratio(cl, 20)
+    h50   = hurst_exp(cl, 50)
+    ent30 = shannon_entropy(cl, 30)
+    sma30 = cl.rolling(30).mean()
+    klm   = kalman_price(cl)
+    tema20 = tema(cl, 20)
+
+    don_hi   = cl.rolling(20).max()
+    don_lo   = cl.rolling(20).min()
+    don_bo   = pd.Series(
+        np.where(cl >= don_hi, 1.0, np.where(cl <= don_lo, -1.0, 0.0)),
+        index=cl.index)
+
+    dm_up  = hi.diff().clip(lower=0)
+    dm_dn  = (-lo.diff()).clip(lower=0)
+    adx    = ((dm_up.where(dm_up > dm_dn, 0) - dm_dn.where(dm_dn > dm_up, 0)).abs()
+              / (dm_up + dm_dn + 1e-9)).rolling(14).mean()
+
+    # ── Top-10 ratios ─────────────────────────────────────────────────────────
+    pf["ratio_01_accel"]        = s10   / s30.replace(0, np.nan)         # slope_10/slope_30
+    pf["ratio_02_trend_snr"]    = s30   / atr14.replace(0, np.nan)       # slope_30/ATR_14
+    pf["ratio_03_eff_slope"]    = s30   * er20                            # slope_30×ER_20
+    pf["ratio_04_pers_slope"]   = s30   * h50                             # slope_30×hurst_50
+    pf["ratio_05_struct_chaos"] = r2_30 / ent30.replace(0, np.nan)       # R²/entropy
+    pf["ratio_06_kalman_sma"]   = klm   / sma30.replace(0, np.nan)       # kalman/SMA
+    pf["ratio_07_tema_kalman"]  = tema20/ klm.replace(0, np.nan)         # TEMA/kalman
+    pf["ratio_08_convexity"]    = s10   - s50                             # slope_10-slope_50
+    pf["ratio_09_adx_entropy"]  = adx   / ent30.replace(0, np.nan)       # ADX/entropy
+    pf["ratio_10_breakout_er"]  = don_bo/ er20.replace(0, np.nan)        # donchian_bo/ER
+
+    NEW_FEATURES = [
+        "quad_curve_20", "quad_curve_50",
+        "spectral_power_ratio_50", "dominant_cycle_50",
+        "regime_duration",
+        "ratio_01_accel",       "ratio_02_trend_snr",
+        "ratio_03_eff_slope",   "ratio_04_pers_slope",
+        "ratio_05_struct_chaos","ratio_06_kalman_sma",
+        "ratio_07_tema_kalman", "ratio_08_convexity",
+        "ratio_09_adx_entropy", "ratio_10_breakout_er",
+    ]
+    LABELS = {
+        "quad_curve_20"         : "Dim 2  — Quadratic curvature (w=20)",
+        "quad_curve_50"         : "Dim 2  — Quadratic curvature (w=50)",
+        "spectral_power_ratio_50": "Dim 3  — Spectral power ratio (Ehlers, w=50)",
+        "dominant_cycle_50"     : "Dim 3  — Dominant cycle period bars (w=50)",
+        "regime_duration"       : "Dim 4  — Regime run length (consecutive bars)",
+        "ratio_01_accel"        : "Ratio 1  slope_10 / slope_30        [acceleration]",
+        "ratio_02_trend_snr"    : "Ratio 2  slope_30 / ATR_14          [trend SNR]",
+        "ratio_03_eff_slope"    : "Ratio 3  slope_30 × ER_20           [eff-weighted slope]",
+        "ratio_04_pers_slope"   : "Ratio 4  slope_30 × hurst_50        [pers-weighted slope]",
+        "ratio_05_struct_chaos" : "Ratio 5  R² / entropy               [structure vs chaos]",
+        "ratio_06_kalman_sma"   : "Ratio 6  kalman / SMA_30            [dynamic vs static]",
+        "ratio_07_tema_kalman"  : "Ratio 7  TEMA_20 / kalman           [curvature disagree]",
+        "ratio_08_convexity"    : "Ratio 8  slope_10 − slope_50        [trend convexity]",
+        "ratio_09_adx_entropy"  : "Ratio 9  ADX / entropy              [structured direction]",
+        "ratio_10_breakout_er"  : "Ratio 10 donchian_breakout / ER     [clean breakout]",
+    }
+
+    # ── Print summary ─────────────────────────────────────────────────────────
+    print(f"\n{'═'*76}")
+    print("  NEW TREND DIMENSIONS & RATIOS — DESCRIPTIVE STATS")
+    print(f"{'═'*76}")
+    print(f"  {'FEATURE':<28}  {'MEAN':>9}  {'STD':>9}  {'MIN':>9}  {'MAX':>9}  {'NaN%':>5}")
+    print(f"  {'─'*74}")
+    for feat in NEW_FEATURES:
+        col = pf[feat]
+        nan_pct = col.isna().mean() * 100
+        if col.notna().any():
+            print(f"  {feat:<28}  {col.mean():>9.4f}  {col.std():>9.4f}  "
+                  f"{col.min():>9.4f}  {col.max():>9.4f}  {nan_pct:>4.1f}%")
+        else:
+            print(f"  {feat:<28}  {'— all NaN —':>39}  {nan_pct:>4.1f}%")
+    print(f"\n  Legend:")
+    for feat, lbl in LABELS.items():
+        print(f"    {feat:<28} → {lbl}")
+
+    # ── Visualise new features ────────────────────────────────────────────────
+    ratio_cols = [c for c in NEW_FEATURES if c.startswith("ratio_")]
+    dim_cols   = [c for c in NEW_FEATURES if not c.startswith("ratio_")]
+
+    fig_new, axes_new = plt.subplots(
+        len(NEW_FEATURES), 1,
+        figsize=(14, 2.5 * len(NEW_FEATURES)),
+        sharex=True)
+    if len(NEW_FEATURES) == 1:
+        axes_new = [axes_new]
+
+    x_idx = pf[PRICE_DATE_COL] if PRICE_DATE_COL in pf.columns else pf.index
+    for ax, feat in zip(axes_new, NEW_FEATURES):
+        col = pf[feat]
+        color = "#e63946" if feat.startswith("ratio_") else "#457b9d"
+        ax.plot(x_idx, col, lw=0.9, color=color, alpha=0.85)
+        ax.axhline(0, ls=":", lw=0.7, color="gray")
+        ax.set_ylabel(feat.replace("ratio_", "R").replace("_", " "),
+                      fontsize=7, rotation=0, ha="right", labelpad=100)
+        ax.tick_params(axis="both", labelsize=6)
+
+    axes_new[0].set_title(
+        "New Trend Dimensions (blue) & Ratios (red)",
+        fontweight="bold", fontsize=11)
+    fig_new.tight_layout()
+    plt.show()
+
+    # ── Export new features ───────────────────────────────────────────────────
+    from datetime import datetime as _dt
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    out_new = f"/content/drive/MyDrive/New_Trend_Features_{_ts}.csv"
+    pf[[PRICE_DATE_COL] + NEW_FEATURES].to_csv(out_new, index=False)
+    print(f"\n✅ New features saved → {out_new}")
+
+except FileNotFoundError:
+    print(f"⚠️  Price file not found: {PRICE_CSV}")
+    print("   Update PRICE_CSV at the top of this cell and re-run.")
+
+
+# %% [10] EXPORT FINAL ROSTERS TO CSV  (renumbered from 9)
 # ─────────────────────────────────────────────────────────────────────────────
 from datetime import datetime
 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -418,7 +681,7 @@ display(HTML(
 ))
 
 
-# %% [10] ITERATION SUFFICIENCY SUMMARY
+# %% [11] ITERATION SUFFICIENCY SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
 print("\n" + "═"*70)
 print("  ITERATION SUFFICIENCY SUMMARY")
