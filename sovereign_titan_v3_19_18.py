@@ -664,10 +664,10 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
         model.fit(
             train_ds, validation_data=val_ds, epochs=epochs,
             callbacks=[
-                EarlyStopping(monitor='val_loss', patience=12,
-                              restore_best_weights=True),
+                EarlyStopping(monitor='val_loss', patience=7,
+                              restore_best_weights=True, min_delta=1e-4),
                 ReduceLROnPlateau(monitor='val_loss', factor=0.5,
-                                  patience=6, min_lr=1e-6),
+                                  patience=4, min_lr=1e-6),
             ],
             verbose=1,
         )
