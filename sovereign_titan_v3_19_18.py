@@ -258,8 +258,11 @@ _warm_up_numba()
 def generate_factory_features_v2(df):
     df = df.copy()
     df['hlc3']    = (df['high'] + df['low'] + df['close']) / 3
-    df['T_FINAL'] = (df['close'].shift(-1) > df['close']).astype('float')
-    df.loc[df.index[-1], 'T_FINAL'] = np.nan   # no future close on last row
+    # Stage 1 spec — No-Lag Target: predict Close_t (contemporaneous log return),
+    # NOT Close_{t+1}.  Forces recurrent gates to learn temporal dependencies
+    # from the feature sequence rather than a forward-looking label.
+    df['T_FINAL'] = np.log(df['close'] / df['close'].shift(1))
+    df.loc[df.index[0], 'T_FINAL'] = np.nan   # no prior close for first row
 
     hlc = df['hlc3'].values.astype(np.float64)
     hi  = df['high'].values.astype(np.float64)
@@ -576,6 +579,13 @@ def _eval_accuracy(model, X_batch, y_batch):
     return tf.reduce_mean(tf.cast(correct, tf.float32))
 
 
+def _eval_mae(model, X_batch, y_batch):
+    """MAE for regression mode.  Not @tf.function — called with variable batch
+    sizes (full val, bull subset, bear subset) so retracing is avoided."""
+    preds = tf.squeeze(model(X_batch, training=False), axis=-1)
+    return float(tf.reduce_mean(tf.abs(preds - tf.cast(y_batch, tf.float32))).numpy())
+
+
 WARMUP_ROWS = 350  # first N rows have unreliable indicator values — excluded from fits
 
 def run_judicial_audit(brain_name, master_df, model_type='GRU',
@@ -613,7 +623,7 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
 
     X_tr  = X_seqs[:train_end];         y_tr  = y_seqs[:train_end]
     X_val = X_seqs[train_end:val_end];  y_val = y_seqs[train_end:val_end]
-    X_te  = X_seqs[val_end:];          y_te  = y_seqs[val_end:]
+    X_te  = X_seqs[val_end:];           y_te  = y_seqs[val_end:]
 
     print(f"  [DATA] train={len(X_tr):,}  val={len(X_val):,}  "
           f"test={len(X_te):,}  input=({seq_len}, {N_COMPS})")
@@ -625,45 +635,64 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
     val_ds   = (tf.data.Dataset.from_tensor_slices((X_val, y_val))
                 .batch(batch_size * 2).prefetch(AUTO))
 
-    # ── Fast Mode model: input is N_COMPS (19), not n_raw ─────────────────────
-    model = build_full_model(model_type, N_COMPS, seq_len)
+    # ── Stage 1 spec: Huber Loss + linear output (regression to log return) ───
+    model = build_full_model(model_type, N_COMPS, seq_len, output_mode='regress')
     with tf.device(DEVICE):
         model.fit(
             train_ds, validation_data=val_ds, epochs=epochs,
             callbacks=[
-                EarlyStopping(monitor='val_loss', patience=5,   # plan: 5
+                EarlyStopping(monitor='val_loss', patience=5,
                               restore_best_weights=True),
                 ReduceLROnPlateau(monitor='val_loss', factor=0.5,
-                                  patience=3, min_lr=1e-6),     # plan: 1e-6
+                                  patience=3, min_lr=1e-6),
             ],
             verbose=1,
         )
 
-    X_val_tf     = tf.constant(X_val)
-    y_val_tf     = tf.constant(y_val)
-    baseline_acc = _eval_accuracy(model, X_val_tf, y_val_tf).numpy()
-    print(f"  [MODEL] Val accuracy:  {baseline_acc:.4f}")
+    baseline_mae = _eval_mae(model, tf.constant(X_val), tf.constant(y_val))
+    print(f"  [MODEL] Val MAE:  {baseline_mae:.6f}")
 
-    # ── Quality gate: reject iterations with no signal ─────────────────────────
-    if baseline_acc < 0.52:
+    # ── Quality gate: model must beat naive zero-predictor ─────────────────────
+    # naive MAE = mean|log_return| since E[log_return] ≈ 0
+    naive_mae = float(np.mean(np.abs(y_val)))
+    if baseline_mae >= naive_mae:
         del model; gc.collect(); tf.keras.backend.clear_session()
-        print(f"  ⚠️  Quality gate FAILED: val_acc={baseline_acc:.4f} < 0.52 — no signal")
+        print(f"  ⚠️  Quality gate FAILED: val_mae={baseline_mae:.6f} "
+              f">= naive={naive_mae:.6f} — no signal")
         return pd.DataFrame()
 
-    # ── Held-out test evaluation (never touched during training) ──────────────
-    X_te_tf  = tf.constant(X_te)
-    y_te_tf  = tf.constant(y_te)
-    test_acc = _eval_accuracy(model, X_te_tf, y_te_tf).numpy()
-    print(f"  [MODEL] Test accuracy: {test_acc:.4f}")
-    if test_acc > 0.70 and baseline_acc > 0.70:
-        print(f"  🚨 LEAKAGE WARNING: val={baseline_acc:.4f}, test={test_acc:.4f} — investigate!")
+    # ── Held-out test evaluation ───────────────────────────────────────────────
+    test_mae = _eval_mae(model, tf.constant(X_te), tf.constant(y_te))
+    print(f"  [MODEL] Test MAE: {test_mae:.6f}")
+    if test_mae < naive_mae * 0.50 and baseline_mae < naive_mae * 0.50:
+        print(f"  🚨 LEAKAGE WARNING: val_mae={baseline_mae:.6f}, "
+              f"test_mae={test_mae:.6f} — investigate!")
+
+    # ── Regime masks (bull = positive log return day, bear = non-positive) ─────
+    # Splits the validation set into up-day and down-day regimes.
+    # A stable feature must show similar importance on BOTH sides.
+    bull_mask = y_val > 0
+    bear_mask = ~bull_mask
+    X_bull = X_val[bull_mask];  y_bull = y_val[bull_mask]
+    X_bear = X_val[bear_mask];  y_bear = y_val[bear_mask]
+
+    # Fallback: if one regime is empty keep full set (avoids div-by-zero)
+    has_bull = bull_mask.any()
+    has_bear = bear_mask.any()
+    baseline_mae_bull = (_eval_mae(model, tf.constant(X_bull), tf.constant(y_bull))
+                         if has_bull else baseline_mae)
+    baseline_mae_bear = (_eval_mae(model, tf.constant(X_bear), tf.constant(y_bear))
+                         if has_bear else baseline_mae)
+    print(f"  [REGIME] bull_mae={baseline_mae_bull:.6f}  "
+          f"bear_mae={baseline_mae_bear:.6f}  "
+          f"(bull={bull_mask.sum()}, bear={bear_mask.sum()})")
 
     # ── Permutation importance: permute in RAW SCALED space, re-apply PCA ──────
     # Permuting raw features (not PCA components) preserves LENS_/WIN_ feature-name
     # granularity required by Block 6 sovereign hunt.
-    # X_scaled slice covering all val sequences: rows train_end … val_end+seq_len
-    val_raw_slice = X_scaled[train_end : val_end + seq_len]  # (val_rows+seq_len, n_raw)
+    val_raw_slice = X_scaled[train_end : val_end + seq_len]
     n_val_rows    = val_end - train_end
+    y_val_tf      = tf.constant(y_val)
 
     report_rows = []
     for fi, feat_name in enumerate(tqdm(feature_cols, desc="Permutation scoring")):
@@ -672,18 +701,38 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
             flat       = X_perm_raw[:, fi].flatten()
             np.random.shuffle(flat)
             X_perm_raw[:, fi] = flat
-            # Re-project through PCA (scaler already applied upstream)
             X_perm_pca  = pca.transform(X_perm_raw).astype(np.float32)
             X_perm_seqs = np.stack([X_perm_pca[k : k + seq_len]
                                     for k in range(n_val_rows)])
-            perm_acc = _eval_accuracy(
-                model, tf.constant(X_perm_seqs), y_val_tf).numpy()
+
+            # ── Full-val MAE impact ────────────────────────────────────────────
+            perm_mae = _eval_mae(model, tf.constant(X_perm_seqs), y_val_tf)
+            I_raw    = max(0.0, perm_mae - baseline_mae)
+
+            # ── Regime stability: consistency of importance across bull/bear ───
+            # I_bull / I_bear: MAE increase when feature is permuted, per regime.
+            # Stability = 1 - |I_bull - I_bear| / (I_bull + I_bear + ε)
+            # → 1.0 if feature equally important in both regimes
+            # → 0.0 if feature only matters in one regime (regime-fragile signal)
+            if has_bull and has_bear:
+                perm_bull = _eval_mae(model, tf.constant(X_perm_seqs[bull_mask]),
+                                      tf.constant(y_bull))
+                perm_bear = _eval_mae(model, tf.constant(X_perm_seqs[bear_mask]),
+                                      tf.constant(y_bear))
+                I_bull    = max(0.0, perm_bull - baseline_mae_bull)
+                I_bear    = max(0.0, perm_bear - baseline_mae_bear)
+                stability = 1.0 - abs(I_bull - I_bear) / (I_bull + I_bear + 1e-9)
+            else:
+                stability = 0.5   # neutral — single-regime data
+
             report_rows.append({
-                'Feature': feat_name,
-                'I_raw':   max(0.0, baseline_acc - perm_acc),
+                'Feature':     feat_name,
+                'I_raw':       I_raw,
+                'I_stability': stability,
             })
         except Exception:
-            report_rows.append({'Feature': feat_name, 'I_raw': 0.0})
+            report_rows.append({'Feature': feat_name, 'I_raw': 0.0,
+                                 'I_stability': 0.5})
 
     del model; gc.collect(); tf.keras.backend.clear_session()
     return pd.DataFrame(report_rows)
@@ -734,14 +783,20 @@ def _parse_feature_name(f):
 
 def apply_sovereign_hunt(ledger_df, master_data_df, brain_name, max_slots=19):
     locked_list = BRAIN_LOCKS.get(brain_name, [])
-    candidates  = ledger_df.sort_values(by='I_raw', ascending=False)
-    picked      = [f for f in locked_list if f in ledger_df['Feature'].values]
+    # Stage 1 spec: sort by Sovereign Score (70% impact + 15% stability + 15%
+    # uniqueness).  Fall back to I_raw if Sov_Score column is not present.
+    sort_col   = 'Sov_Score' if 'Sov_Score' in ledger_df.columns else 'I_raw'
+    candidates = ledger_df.sort_values(by=sort_col, ascending=False)
+    picked     = [f for f in locked_list if f in ledger_df['Feature'].values]
 
     for lf in locked_list:
         if lf not in ledger_df['Feature'].values:
             print(f"  ⚠️  BRAIN_LOCK '{lf}' not found — check name")
 
-    CORR_THRESHOLD = 0.75
+    # Stage 1 spec: Uniqueness threshold = 0.95 (Identity Function Trap only).
+    # At 15% weight uniqueness is a diversity floor, not a primary filter.
+    # Features are allowed through unless they are extreme clones (|r| > 0.95).
+    CORR_THRESHOLD = 0.95
     # Track which lookback is committed per family
     # e.g. family_lookback['cog'] = 'LENS_10_cog_20'
     # → blocks 'LENS_90_cog_20' but not more LENS_10_cog_20 transforms
@@ -778,18 +833,59 @@ def apply_sovereign_hunt(ledger_df, master_data_df, brain_name, max_slots=19):
     return picked, cumvar, n_for_95
 
 def generate_judicial_ledger(brain_name, report_df, master_data_df, iteration=1):
-    df           = report_df.copy()
-    df['I_Norm'] = (df['I_raw'] - df['I_raw'].min()) / \
-                   (df['I_raw'].max() - df['I_raw'].min() + 1e-9)
+    df = report_df.copy()
 
+    # ── Normalized Impact (I_Norm) ─────────────────────────────────────────────
+    df['I_Norm'] = ((df['I_raw'] - df['I_raw'].min()) /
+                    (df['I_raw'].max() - df['I_raw'].min() + 1e-9))
+
+    # ── Audit Vitality Gate ────────────────────────────────────────────────────
+    # Spec: "Terminate any feature audit where mean I_Norm falls below 0.05."
+    # This indicates the feature set has found no tradeable signal beyond noise.
+    mean_i_norm = df['I_Norm'].mean()
+    if mean_i_norm < 0.05:
+        print(f"  🚨 VITALITY GATE: mean I_Norm={mean_i_norm:.4f} < 0.05 — "
+              f"no tradeable signal beyond noise — audit terminated")
+        return pd.DataFrame()
+
+    # ── Pre-compute UV_score: intrinsic diversity of each feature vs. pool ─────
+    # UV_score_i = 1 - mean(|corr(i, j)|) for all j ≠ i in the candidate pool.
+    # This is the 15%-weighted uniqueness component of the Sovereign Score.
+    # Hard gate (Identity Function Trap: |r| > 0.95) is enforced in sovereign hunt.
+    feat_pool    = df['Feature'].tolist()
+    feat_cols_ok = [c for c in master_data_df.columns
+                    if (c.startswith('LENS_') or c.startswith('WIN_'))
+                    and c in feat_pool]
+    corr_full = (master_data_df[feat_cols_ok].corr().abs()
+                 if feat_cols_ok else pd.DataFrame())
+    uv_map = {}
+    for f in feat_pool:
+        if f in corr_full.columns:
+            others    = [c for c in feat_cols_ok if c != f]
+            uv_map[f] = float(1.0 - corr_full[f].loc[others].mean()) if others else 1.0
+        else:
+            uv_map[f] = 0.5
+    df['UV_score'] = df['Feature'].map(uv_map).fillna(0.5)
+
+    # ── Sovereign Score = 70% Impact + 15% Stability + 15% Uniqueness ─────────
+    stab_col = 'I_stability' if 'I_stability' in df.columns else None
+    df['Stab_Norm'] = df[stab_col].clip(0.0, 1.0) if stab_col else 0.5
+    df['Sov_Score'] = (0.70 * df['I_Norm'] +
+                       0.15 * df['Stab_Norm'] +
+                       0.15 * df['UV_score'].clip(0.0, 1.0))
+
+    # ── Sovereign Hunt (ranked by Sov_Score; hard gate |r|>0.95) ──────────────
     active_picks, var_map, n95 = apply_sovereign_hunt(df, master_data_df, brain_name)
     corr_sub = master_data_df[active_picks].corr().abs()
     avg_corr = ((corr_sub.sum().sum() - len(active_picks)) /
                 (len(active_picks)**2 - len(active_picks) + 1e-9))
 
+    W = 78   # total inner width for box borders
     print(f"\n╔══ {brain_name} SOVEREIGN CORE V.3.19.18 (Iter {iteration}) ══╗")
-    print(f"║ {'RNK':<3} | {'TREND FEATURE':<35} | {'UV%':<4} | {'mR':<4} | {'IMPACT':<8} ║")
-    print("╠" + "═"*4 + "╬" + "═"*37 + "╬" + "═"*6 + "╬" + "═"*6 + "╬" + "═"*10 + "╣")
+    print(f"║ {'RNK':<3} │ {'TREND FEATURE':<33} │ {'SOV':>5} │ "
+          f"{'IMP':>5} │ {'STB':>5} │ {'UV%':>4} ║")
+    print("╠" + "═"*5 + "╪" + "═"*35 + "╪" + "═"*7 + "╪" +
+          "═"*7 + "╪" + "═"*7 + "╪" + "═"*6 + "╣")
 
     for i, f_name in enumerate(active_picks):
         f_row       = df[df['Feature'] == f_name].iloc[0]
@@ -799,17 +895,22 @@ def generate_judicial_ledger(brain_name, report_df, master_data_df, iteration=1)
         max_r  = corr_sub[f_name].loc[other_picks].max() if other_picks else 0.0
         uv_val = ((1 - corr_sub[f_name].loc[other_picks].mean()) * 100
                   if other_picks else 100.0)
-        print(f"║ {i+1:02d}  | {icon} {f_name[:33]:<33} | "
-              f"{uv_val:>3.0f}% | {max_r:.2f} | {f_row['I_Norm']:.4f} ║")
+        sov = f_row['Sov_Score']
+        imp = f_row['I_Norm']
+        stb = f_row['Stab_Norm']
+        print(f"║ {i+1:02d}   │ {icon} {f_name[:31]:<31} │ "
+              f"{sov:.3f} │ {imp:.3f} │ {stb:.3f} │ {uv_val:>3.0f}% ║")
         df.loc[df['Feature'] == f_name,
                ['UV%', 'Max_R', 'Is_Locked']] = [uv_val, max_r, is_locked]
 
-    print("╠" + "═"*73 + "╣")
-    print(f"║ PCA 95% VAR THRESHOLD: {n95:>2} of {len(active_picks)} components needed"
-          f"{'':>26}║")
-    print(f"║ AVG TEAM CROSS-CORRELATION:   {avg_corr:>35.3f} ║")
-    print(f"║ SLOTS FILLED:                 {len(active_picks):>35}/19 ║")
-    print("╚" + "═"*73 + "╝")
+    print("╠" + "═"*75 + "╣")
+    print(f"║ SOV SCORE WEIGHTS : 70% Impact · 15% Stability · 15% Uniqueness"
+          f"{'':>10}║")
+    print(f"║ PCA 95% THRESHOLD : {n95:>2} of {len(active_picks)} components needed"
+          f"{'':>38}║")
+    print(f"║ AVG TEAM CROSS-CORR:          {avg_corr:>44.3f} ║")
+    print(f"║ SLOTS FILLED:                 {len(active_picks):>44}/19 ║")
+    print("╚" + "═"*75 + "╝")
 
     return df[df['Feature'].isin(active_picks)]
 
@@ -849,6 +950,9 @@ for BRAIN in BRAINS_TO_RUN:
 
         iteration_ledger = generate_judicial_ledger(BRAIN, report_raw,
                                                     master_df, iteration=it)
+        if iteration_ledger.empty:
+            print("  ⚠️  Vitality gate — iteration skipped.")
+            continue
         iteration_ledger['Iteration']  = it
         iteration_ledger['Brain']      = BRAIN
         iteration_ledger['Model_Type'] = CURRENT_MODEL_TYPE
