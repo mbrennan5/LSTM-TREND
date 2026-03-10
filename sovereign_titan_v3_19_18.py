@@ -446,8 +446,10 @@ def _process_symbol_worker(args):
 
 # ==============================================================================
 # ### BLOCK 4: PARALLEL LOADER
-# Phase 1: parallel network I/O   (ThreadPoolExecutor)
-# Phase 2: parallel feature gen   (ProcessPoolExecutor — true multi-core)
+# Phase 1: parallel network I/O      (ThreadPoolExecutor)
+# Phase 2: parallel feature gen      (ThreadPoolExecutor — GIL released by
+#           numpy/pandas heavy ops; ProcessPool excluded: Colab/Jupyter
+#           subprocesses cannot import functions from __main__ kernel scope)
 # ==============================================================================
 def fetch_data(symbol, period="6y"):
     try:
@@ -482,27 +484,20 @@ def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
         return pd.DataFrame()
 
     # ── Phase 2: parallel feature generation ──────────────────────────────────
-    # DataFrames are passed as dicts and reconstructed inside the worker
-    # to ensure pickle compatibility across all Colab environments.
+    # Use ThreadPoolExecutor: threads share the kernel namespace so
+    # _process_symbol_worker is always reachable.  ProcessPoolExecutor is
+    # excluded because Colab/Jupyter subprocesses cannot unpickle functions
+    # defined in __main__ (the notebook kernel) — guaranteed NameError.
     work_items = [(sym, df.to_dict()) for sym, df in raw_results.items()]
     all_data   = []
 
     print(f"⚙ Building features in parallel (workers={N_FEATURE_WORKERS})...")
-    try:
-        with ProcessPoolExecutor(max_workers=N_FEATURE_WORKERS) as pool:
-            futures = {pool.submit(_process_symbol_worker, item): item[0]
-                       for item in work_items}
-            for fut in tqdm(as_completed(futures), total=len(work_items),
-                            desc="⚙ Features"):
-                result = fut.result()
-                if result is not None:
-                    result = result.set_index(result.columns[0])
-                    all_data.append(result)
-    except Exception as e:
-        # Fallback: sequential (safe in any Colab environment)
-        print(f"  ⚠️  ProcessPool failed ({e}) — falling back to sequential")
-        for item in tqdm(work_items, desc="⚙ Features (sequential)"):
-            result = _process_symbol_worker(item)
+    with ThreadPoolExecutor(max_workers=N_FEATURE_WORKERS) as pool:
+        futures = {pool.submit(_process_symbol_worker, item): item[0]
+                   for item in work_items}
+        for fut in tqdm(as_completed(futures), total=len(work_items),
+                        desc="⚙ Features"):
+            result = fut.result()
             if result is not None:
                 result = result.set_index(result.columns[0])
                 all_data.append(result)
