@@ -40,13 +40,31 @@ def bad(text): return f"{RED}{text}{RESET}"
 DIVIDER  = "═" * 70
 DIVIDER2 = "─" * 70
 
+# ==============================================================================
+# INDICATOR GROUP TAXONOMY  (matches sovereign_titan_v3_19_18.py feature set)
+# ==============================================================================
+#   LENS_XX features  — z-scored then slope/sos transformed
+#   WIN_XX  features  — rolling % deviation (suffix = pct)
+# Groups reflect the input signal type, not the transform applied.
+INDICATOR_GROUPS = {
+    "Bounded Oscillators": {
+        "er", "vidya_cmo", "r_sq", "hurst", "shannon", "adx",
+        "logistic_prob", "aroon_up", "donchian_high", "dispersion", "lr_slope",
+    },
+    "Price MA Ratios": {"tema", "sma", "hma", "kalman"},
+    "Price-Unit Osc":  {"mtsi"},
+    "WIN Rolling COG": {"cog"},
+}
+# reverse lookup: family → group label
+_FAM_TO_GROUP = {fam: grp for grp, fams in INDICATOR_GROUPS.items() for fam in fams}
+
 
 # ==============================================================================
 # FEATURE NAME PARSER
 # ==============================================================================
 _LENS_RE    = re.compile(r"^LENS_(\d+)_", re.IGNORECASE)
 _WIN_RE     = re.compile(r"^WIN_(\d+)_",  re.IGNORECASE)
-_SUFFIX_RE  = re.compile(r"_(z(?:_slope|_sos)?)$", re.IGNORECASE)
+_SUFFIX_RE  = re.compile(r"_(z(?:_slope|_sos)?|pct)$", re.IGNORECASE)
 
 def parse_feature(name: str) -> dict:
     """Break a feature column name into its structural parts."""
@@ -102,7 +120,11 @@ def load_csv(path: str) -> pd.DataFrame:
     # attach parsed fields
     parsed        = df["Feature"].apply(parse_feature).apply(pd.Series)
     df            = pd.concat([df, parsed[["lens","window","family","period","suffix"]]], axis=1)
-    df["src_type"]= df["lens"].apply(lambda v: f"LENS_{v}" if pd.notna(v) else "WIN")
+    df["src_type"] = df.apply(
+        lambda r: f"LENS_{int(r['lens'])}" if pd.notna(r["lens"])
+                  else (f"WIN_{int(r['window'])}" if pd.notna(r["window"]) else "WIN"),
+        axis=1
+    )
 
     return df
 
@@ -165,9 +187,23 @@ def report_brain(brain: str, bdf: pd.DataFrame, num_iters: int):
     # ── family breakdown ──────────────────────────────────────────────────────
     fam_counts = bdf.groupby("family")["I_Norm"].mean().sort_values(ascending=False)
     print(h("  Family breakdown (avg I_Norm):"))
-    for fam, val in fam_counts.head(10).items():
-        bar = "█" * int(val * 40)
-        print(f"    {fam:<28} {val:.4f}  {bar}")
+    for fam, val in fam_counts.items():          # all families, not just top 10
+        grp  = _FAM_TO_GROUP.get(fam, "Other")
+        bar  = "█" * int(val * 40)
+        print(f"    {fam:<28} {val:.4f}  [{grp}]  {bar}")
+
+    # ── period breakdown ──────────────────────────────────────────────────────
+    per_df = bdf[bdf["period"].notna()]
+    if not per_df.empty:
+        print()
+        print(h("  Period breakdown (avg I_Norm per indicator period):"))
+        per_grp = (per_df.groupby(["family","period"])["I_Norm"]
+                         .mean()
+                         .reset_index()
+                         .sort_values("I_Norm", ascending=False))
+        for _, row in per_grp.iterrows():
+            print(f"    {row['family']:<22}  period={int(row['period']):>3}  "
+                  f"avg={row['I_Norm']:.4f}")
 
     # ── LENS split ────────────────────────────────────────────────────────────
     if bdf["src_type"].notna().any():
@@ -196,6 +232,86 @@ def report_brain(brain: str, bdf: pd.DataFrame, num_iters: int):
                   f"avg_imp={r['Avg_Imp']:.4f}")
 
     return top
+
+
+# ==============================================================================
+# INPUT GROUP ANALYSIS
+# ==============================================================================
+def report_input_groups(df: pd.DataFrame):
+    """Break down importance by indicator group, LENS/WIN bucket, and period."""
+    print(f"\n{DIVIDER}")
+    print(h("  INPUT GROUP ANALYSIS"))
+    print(DIVIDER)
+
+    df2 = df.copy()
+    df2["group"] = df2["family"].map(_FAM_TO_GROUP).fillna("Other")
+
+    # ── Group-level summary ───────────────────────────────────────────────────
+    grp_stats = (df2.groupby("group")["I_Norm"]
+                    .agg(Count="count", Avg="mean", Max="max")
+                    .sort_values("Avg", ascending=False))
+    print(h("\n  Indicator group  (avg I_Norm):"))
+    print(f"  {'GROUP':<24} {'COUNT':>6} {'AVG_IMP':>9} {'MAX_IMP':>9}")
+    print("  " + "─" * 52)
+    for grp, row in grp_stats.iterrows():
+        bar = "█" * int(row["Avg"] * 40)
+        print(f"  {grp:<24} {int(row['Count']):>6}  {row['Avg']:>8.4f}  "
+              f"{row['Max']:>8.4f}  {bar}")
+
+    # ── LENS_10 vs LENS_90 for bounded / MA families ──────────────────────────
+    lens_df = df2[df2["lens"].notna()]
+    if not lens_df.empty:
+        print(h("\n  LENS_10 vs LENS_90 (bounded oscillators + price MA ratios):"))
+        lens_cmp = (lens_df.groupby(["group", "src_type"])["I_Norm"]
+                           .mean()
+                           .unstack("src_type", fill_value=float("nan"))
+                           .sort_values("LENS_10" if "LENS_10" in
+                                        lens_df["src_type"].unique() else
+                                        lens_df["src_type"].iloc[0],
+                                        ascending=False, na_position="last"))
+        cols = sorted(lens_cmp.columns)
+        header = f"  {'GROUP':<24}" + "".join(f"  {c:>10}" for c in cols)
+        print(header)
+        print("  " + "─" * (24 + 12 * len(cols)))
+        for grp, row in lens_cmp.iterrows():
+            vals = "".join(
+                f"  {row[c]:>10.4f}" if not pd.isna(row.get(c, float("nan"))) else "         —"
+                for c in cols)
+            print(f"  {grp:<24}{vals}")
+
+    # ── WIN window split ──────────────────────────────────────────────────────
+    win_df = df2[df2["window"].notna()]
+    if not win_df.empty:
+        print(h("\n  WIN rolling (COG) — by window size:"))
+        win_cmp = (win_df.groupby("src_type")["I_Norm"]
+                         .agg(Count="count", Avg="mean")
+                         .sort_values("Avg", ascending=False))
+        for src, row in win_cmp.iterrows():
+            bar = "█" * int(row["Avg"] * 40)
+            print(f"    {src:<12}  cnt={int(row['Count']):>4}  avg={row['Avg']:.4f}  {bar}")
+
+    # ── Period breakdown ──────────────────────────────────────────────────────
+    per_df = df2[df2["period"].notna()]
+    if not per_df.empty:
+        print(h("\n  Period breakdown (avg I_Norm per indicator period):"))
+        per_cmp = (per_df.groupby(["family", "period"])["I_Norm"]
+                         .mean()
+                         .reset_index()
+                         .sort_values("I_Norm", ascending=False))
+        for _, row in per_cmp.iterrows():
+            print(f"    {row['family']:<22}  period={int(row['period']):>3}  "
+                  f"avg={row['I_Norm']:.4f}")
+
+    # ── Suffix / transform breakdown ──────────────────────────────────────────
+    suf_df = df2[df2["suffix"].notna()]
+    if not suf_df.empty:
+        print(h("\n  Transform suffix (avg I_Norm):"))
+        suf_cmp = (suf_df.groupby("suffix")["I_Norm"]
+                         .agg(Count="count", Avg="mean")
+                         .sort_values("Avg", ascending=False))
+        for suf, row in suf_cmp.iterrows():
+            bar = "█" * int(row["Avg"] * 40)
+            print(f"    _{suf:<14}  cnt={int(row['Count']):>4}  avg={row['Avg']:.4f}  {bar}")
 
 
 # ==============================================================================
@@ -316,6 +432,36 @@ def report_risk_flags(df: pd.DataFrame):
             if lk not in all_features:
                 flags.append(bad(f"  ✖  BRAIN_LOCK '{lk}' ({brain}) not found in CSV"))
 
+    # WIN rolling group — expect all 3 windows
+    expected_win = {"WIN_10_cog_20_pct", "WIN_30_cog_20_pct", "WIN_90_cog_20_pct"}
+    missing_win  = expected_win - all_features
+    if missing_win:
+        flags.append(warn(f"  ⚠  WIN rolling COG features missing: "
+                          f"{', '.join(sorted(missing_win))}"))
+
+    # LENS parity — every LENS_10 feature should have a LENS_90 counterpart
+    l10 = {f for f in all_features if f.startswith("LENS_10_")}
+    l90 = {f for f in all_features if f.startswith("LENS_90_")}
+    def _strip_lens(name):
+        return re.sub(r"^LENS_\d+_", "", name)
+    l10_bodies = {_strip_lens(f) for f in l10}
+    l90_bodies = {_strip_lens(f) for f in l90}
+    only_10 = l10_bodies - l90_bodies
+    only_90 = l90_bodies - l10_bodies
+    if only_10:
+        flags.append(warn(f"  ⚠  {len(only_10)} feature(s) have LENS_10 but no LENS_90 "
+                          f"counterpart: {', '.join(sorted(only_10)[:5])}..."))
+    if only_90:
+        flags.append(warn(f"  ⚠  {len(only_90)} feature(s) have LENS_90 but no LENS_10 "
+                          f"counterpart: {', '.join(sorted(only_90)[:5])}..."))
+
+    # Unknown families (not in any known indicator group)
+    known_fams = {f for fams in INDICATOR_GROUPS.values() for f in fams}
+    unknown_fams = set(df["family"].dropna().unique()) - known_fams
+    if unknown_fams:
+        flags.append(warn(f"  ⚠  Unknown indicator families (not in INDICATOR_GROUPS): "
+                          f"{', '.join(sorted(unknown_fams))}"))
+
     if flags:
         for f in flags:
             print(f)
@@ -434,6 +580,44 @@ def save_charts(df: pd.DataFrame, out_dir: str, num_iters: int):
     plt.close(fig4)
     print(ok(f"  Chart saved: {p4}"))
 
+    # ── Chart 5: Indicator group importance per brain ─────────────────────────
+    df5 = df.copy()
+    df5["group"] = df5["family"].map(_FAM_TO_GROUP).fillna("Other")
+    grp_pivot = (df5.groupby(["Brain", "group"])["I_Norm"]
+                     .mean()
+                     .unstack("group", fill_value=0))
+    fig5, ax5 = plt.subplots(figsize=(max(8, n * 3), 5))
+    grp_pivot.plot(kind="bar", ax=ax5, colormap="Paired", width=0.7)
+    ax5.set_title("Avg I_Norm by Indicator Group per Brain", fontweight="bold")
+    ax5.set_ylabel("Avg I_Norm")
+    ax5.set_xlabel("")
+    ax5.tick_params(axis="x", rotation=0)
+    ax5.legend(title="Indicator Group", fontsize=8, loc="upper right")
+    fig5.tight_layout()
+    p5 = os.path.join(out_dir, "indicator_groups.png")
+    fig5.savefig(p5, dpi=150)
+    plt.close(fig5)
+    print(ok(f"  Chart saved: {p5}"))
+
+    # ── Chart 6: LENS_10 vs LENS_90 avg importance per brain ─────────────────
+    lens_df = df[df["lens"].notna()]
+    if not lens_df.empty:
+        lens_piv = (lens_df.groupby(["Brain", "src_type"])["I_Norm"]
+                           .mean()
+                           .unstack("src_type", fill_value=0))
+        fig6, ax6 = plt.subplots(figsize=(max(6, n * 2), 4))
+        lens_piv.plot(kind="bar", ax=ax6, colormap="coolwarm", width=0.6)
+        ax6.set_title("LENS_10 vs LENS_90 — Avg I_Norm per Brain", fontweight="bold")
+        ax6.set_ylabel("Avg I_Norm")
+        ax6.set_xlabel("")
+        ax6.tick_params(axis="x", rotation=0)
+        ax6.legend(title="LENS", fontsize=8)
+        fig6.tight_layout()
+        p6 = os.path.join(out_dir, "lens_10_vs_90.png")
+        fig6.savefig(p6, dpi=150)
+        plt.close(fig6)
+        print(ok(f"  Chart saved: {p6}"))
+
 
 # ==============================================================================
 # MAIN
@@ -494,6 +678,9 @@ def main():
 
     # ── global sovereign summary ──────────────────────────────────────────────
     report_sovereign_summary(df, num_iters)
+
+    # ── input group analysis ──────────────────────────────────────────────────
+    report_input_groups(df)
 
     # ── cross-brain ───────────────────────────────────────────────────────────
     if len(brains) > 1:
