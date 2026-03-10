@@ -567,7 +567,7 @@ def build_full_model(model_type, n_features, seq_len, output_mode='classify',
                 Dense(1,  activation=out_act, dtype='float32'),
             ])
 
-        model.compile(optimizer=Adam(1e-3), loss=loss_fn, metrics=metrics)
+        model.compile(optimizer=Adam(3e-4), loss=loss_fn, metrics=metrics)
     return model
 
 
@@ -589,7 +589,7 @@ def _eval_mae(model, X_batch, y_batch):
 WARMUP_ROWS = 350  # first N rows have unreliable indicator values — excluded from fits
 
 def run_judicial_audit(brain_name, master_df, model_type='GRU',
-                       seq_len=30, epochs=20, batch_size=2048):
+                       seq_len=30, epochs=60, batch_size=2048):
     feature_cols = [c for c in master_df.columns
                     if c.startswith('LENS_') or c.startswith('WIN_')]
     n_raw   = len(feature_cols)
@@ -641,10 +641,10 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
         model.fit(
             train_ds, validation_data=val_ds, epochs=epochs,
             callbacks=[
-                EarlyStopping(monitor='val_loss', patience=5,
+                EarlyStopping(monitor='val_loss', patience=12,
                               restore_best_weights=True),
                 ReduceLROnPlateau(monitor='val_loss', factor=0.5,
-                                  patience=3, min_lr=1e-6),
+                                  patience=6, min_lr=1e-6),
             ],
             verbose=1,
         )
