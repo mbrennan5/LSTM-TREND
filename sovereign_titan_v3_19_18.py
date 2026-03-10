@@ -515,13 +515,15 @@ def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
     return pd.concat(all_data, axis=0)
 
 # ==============================================================================
-# ### BLOCK 5: GPU-ACCELERATED AUDIT  (v4.0 Plan-Aligned)
-# Two architecture changes vs prior version (per master_md5.md best practices):
-#   1. Fast Mode model [64, 32, 16]  — 100k → 25k params  (3-5x faster)
-#   2. Plan Step 9: PCA n_raw → 19  — compresses input before training
-#      Fit on train only (warmup excluded) — anti-leakage compliant.
-# Permutation importance: permutes raw scaled features, re-applies PCA each
-# pass — preserves LENS_/WIN_ feature-name granularity for Block 6 sovereign hunt.
+# ### BLOCK 5: GPU-ACCELERATED AUDIT  (v4.1 Brain-Mandate Aligned)
+# Brain mandate restored per master_md5.md architecture requirements:
+#   DIRECTION → GRU  + binary_crossentropy + accuracy quality gate (> 50%)
+#   EASE/EXP  → LSTM + Huber              + Pearson r gate (> 0.005 S1SFT)
+# S1SFT Pearson threshold (0.005) is intentionally lower than S2MFT production
+# gate (0.02) — TREND-only features show weak-but-real signal at this stage.
+# Permutation importance adapted per brain:
+#   DIRECTION → accuracy DROP when feature permuted (higher = more important)
+#   EASE/EXP  → MAE RISE when feature permuted    (higher = more important)
 # ==============================================================================
 
 N_PCA_COMPONENTS = 19   # Plan: S1SFT target — 19 within-family champions
@@ -590,13 +592,25 @@ WARMUP_ROWS = 350  # first N rows have unreliable indicator values — excluded 
 
 def run_judicial_audit(brain_name, master_df, model_type='GRU',
                        seq_len=30, epochs=60, batch_size=2048):
+    # ── Brain mandate: enforce architecture per md5 spec ──────────────────────
+    # DIRECTION → GRU + classify;  EASE / EXP → LSTM + regress
+    # The caller's model_type hint is overridden to keep architecture compliant.
+    is_classify = (brain_name == 'DIRECTION')
+    model_type  = 'GRU'      if is_classify else 'LSTM'
+    output_mode = 'classify' if is_classify else 'regress'
+
     feature_cols = [c for c in master_df.columns
                     if c.startswith('LENS_') or c.startswith('WIN_')]
     n_raw   = len(feature_cols)
     N_COMPS = min(N_PCA_COMPONENTS, n_raw)   # safety: can't exceed raw count
 
     X_raw = master_df[feature_cols].values
-    y_raw = master_df['T_FINAL'].values.astype(np.float32)
+    # DIRECTION: binarise target (up day = 1, down/flat = 0)
+    # EASE/EXP:  use raw continuous value
+    if is_classify:
+        y_raw = (master_df['T_FINAL'].values > 0).astype(np.float32)
+    else:
+        y_raw = master_df['T_FINAL'].values.astype(np.float32)
     n     = len(X_raw)
     n_seq = n - seq_len
 
@@ -635,8 +649,7 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
     val_ds   = (tf.data.Dataset.from_tensor_slices((X_val, y_val))
                 .batch(batch_size * 2).prefetch(AUTO))
 
-    # ── Stage 1 spec: Huber Loss + linear output (regression to log return) ───
-    model = build_full_model(model_type, N_COMPS, seq_len, output_mode='regress')
+    model = build_full_model(model_type, N_COMPS, seq_len, output_mode=output_mode)
     with tf.device(DEVICE):
         model.fit(
             train_ds, validation_data=val_ds, epochs=epochs,
@@ -649,57 +662,90 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
             verbose=1,
         )
 
-    baseline_mae = _eval_mae(model, tf.constant(X_val), tf.constant(y_val))
-    print(f"  [MODEL] Val MAE:  {baseline_mae:.6f}")
+    X_val_tf      = tf.constant(X_val)
+    y_val_tf_gate = tf.constant(y_val)
 
-    # ── Quality gate: MAE vs naive OR positive Pearson r ──────────────────────
-    # Huber/MSE training converges to the conditional MEAN, not the MAE-optimal
-    # conditional median — so a model with real directional signal can still lose
-    # on MAE vs the zero-predictor.  Pearson r > 0 is the correct signal test:
-    # it detects directional learning independent of magnitude calibration.
-    naive_mae  = float(np.mean(np.abs(y_val)))
-    val_preds  = tf.squeeze(model(tf.constant(X_val), training=False),
-                            axis=-1).numpy().flatten()
-    pearson_r  = float(np.corrcoef(val_preds, y_val.flatten())[0, 1])
-    passes_mae  = baseline_mae < naive_mae
-    passes_corr = pearson_r > 0.02
-    print(f"  [GATE] passes_mae={passes_mae}  pearson_r={pearson_r:.4f}  "
-          f"passes_corr={passes_corr}")
-    if not (passes_mae or passes_corr):
-        del model; gc.collect(); tf.keras.backend.clear_session()
-        print(f"  ⚠️  Quality gate FAILED: val_mae={baseline_mae:.6f} "
-              f">= naive={naive_mae:.6f}, r={pearson_r:.4f} — no signal")
-        return pd.DataFrame()
+    # ── Brain-specific baseline metric & quality gate ──────────────────────────
+    if is_classify:
+        # DIRECTION: must beat coin-flip (50%)
+        baseline_metric = float(
+            _eval_accuracy(model, X_val_tf, y_val_tf_gate).numpy())
+        print(f"  [MODEL] Val Accuracy: {baseline_metric:.4f}")
+        passes_gate = baseline_metric > 0.50
+        print(f"  [GATE] val_accuracy={baseline_metric:.4f}  passes={passes_gate}")
+        if not passes_gate:
+            del model; gc.collect(); tf.keras.backend.clear_session()
+            print(f"  ⚠️  Quality gate FAILED: accuracy={baseline_metric:.4f} "
+                  f"<= 0.50 — no directional signal")
+            return pd.DataFrame()
+        # Held-out test
+        test_metric = float(
+            _eval_accuracy(model, tf.constant(X_te), tf.constant(y_te)).numpy())
+        print(f"  [MODEL] Test Accuracy: {test_metric:.4f}")
+        if test_metric > 0.70 and baseline_metric > 0.70:
+            print(f"  🚨 LEAKAGE WARNING: val_acc={baseline_metric:.4f}, "
+                  f"test_acc={test_metric:.4f} — investigate!")
+    else:
+        # EASE / EXP: MAE + Pearson gate.
+        # S1SFT threshold r > 0.005 (vs S2MFT production gate 0.02) —
+        # TREND-only features show weak-but-real signal at this stage; the gate
+        # must detect signal presence for feature ranking, not production accuracy.
+        baseline_metric = _eval_mae(model, X_val_tf, y_val_tf_gate)
+        print(f"  [MODEL] Val MAE: {baseline_metric:.6f}")
+        naive_mae   = float(np.mean(np.abs(y_val)))
+        val_preds   = tf.squeeze(model(X_val_tf, training=False),
+                                 axis=-1).numpy().flatten()
+        pearson_r   = float(np.corrcoef(val_preds, y_val.flatten())[0, 1])
+        passes_mae  = baseline_metric < naive_mae
+        passes_corr = pearson_r > 0.005          # S1SFT threshold
+        print(f"  [GATE] passes_mae={passes_mae}  pearson_r={pearson_r:.4f}  "
+              f"passes_corr={passes_corr}")
+        if not (passes_mae or passes_corr):
+            del model; gc.collect(); tf.keras.backend.clear_session()
+            print(f"  ⚠️  Quality gate FAILED: val_mae={baseline_metric:.6f} "
+                  f">= naive={naive_mae:.6f}, r={pearson_r:.4f} — no signal")
+            return pd.DataFrame()
+        # Held-out test
+        test_metric = _eval_mae(model, tf.constant(X_te), tf.constant(y_te))
+        print(f"  [MODEL] Test MAE: {test_metric:.6f}")
+        if test_metric < naive_mae * 0.50 and baseline_metric < naive_mae * 0.50:
+            print(f"  🚨 LEAKAGE WARNING: val_mae={baseline_metric:.6f}, "
+                  f"test_mae={test_metric:.6f} — investigate!")
 
-    # ── Held-out test evaluation ───────────────────────────────────────────────
-    test_mae = _eval_mae(model, tf.constant(X_te), tf.constant(y_te))
-    print(f"  [MODEL] Test MAE: {test_mae:.6f}")
-    if test_mae < naive_mae * 0.50 and baseline_mae < naive_mae * 0.50:
-        print(f"  🚨 LEAKAGE WARNING: val_mae={baseline_mae:.6f}, "
-              f"test_mae={test_mae:.6f} — investigate!")
-
-    # ── Regime masks (bull = positive log return day, bear = non-positive) ─────
-    # Splits the validation set into up-day and down-day regimes.
-    # A stable feature must show similar importance on BOTH sides.
+    # ── Regime masks (bull = up day, bear = down/flat day) on validation set ───
+    # A stable feature must show consistent importance in BOTH regimes.
     bull_mask = y_val > 0
     bear_mask = ~bull_mask
     X_bull = X_val[bull_mask];  y_bull = y_val[bull_mask]
     X_bear = X_val[bear_mask];  y_bear = y_val[bear_mask]
 
-    # Fallback: if one regime is empty keep full set (avoids div-by-zero)
+    # Fallback: if one regime is empty keep full-set metric (avoids div-by-zero)
     has_bull = bull_mask.any()
     has_bear = bear_mask.any()
-    baseline_mae_bull = (_eval_mae(model, tf.constant(X_bull), tf.constant(y_bull))
-                         if has_bull else baseline_mae)
-    baseline_mae_bear = (_eval_mae(model, tf.constant(X_bear), tf.constant(y_bear))
-                         if has_bear else baseline_mae)
-    print(f"  [REGIME] bull_mae={baseline_mae_bull:.6f}  "
-          f"bear_mae={baseline_mae_bear:.6f}  "
-          f"(bull={bull_mask.sum()}, bear={bear_mask.sum()})")
+    if is_classify:
+        baseline_bull = (float(_eval_accuracy(model, tf.constant(X_bull),
+                                              tf.constant(y_bull)).numpy())
+                         if has_bull else baseline_metric)
+        baseline_bear = (float(_eval_accuracy(model, tf.constant(X_bear),
+                                              tf.constant(y_bear)).numpy())
+                         if has_bear else baseline_metric)
+        print(f"  [REGIME] bull_acc={baseline_bull:.4f}  "
+              f"bear_acc={baseline_bear:.4f}  "
+              f"(bull={bull_mask.sum()}, bear={bear_mask.sum()})")
+    else:
+        baseline_bull = (_eval_mae(model, tf.constant(X_bull), tf.constant(y_bull))
+                         if has_bull else baseline_metric)
+        baseline_bear = (_eval_mae(model, tf.constant(X_bear), tf.constant(y_bear))
+                         if has_bear else baseline_metric)
+        print(f"  [REGIME] bull_mae={baseline_bull:.6f}  "
+              f"bear_mae={baseline_bear:.6f}  "
+              f"(bull={bull_mask.sum()}, bear={bear_mask.sum()})")
 
     # ── Permutation importance: permute in RAW SCALED space, re-apply PCA ──────
     # Permuting raw features (not PCA components) preserves LENS_/WIN_ feature-name
     # granularity required by Block 6 sovereign hunt.
+    # DIRECTION: I_raw = accuracy DROP  (baseline - permuted, clipped ≥ 0)
+    # EASE/EXP:  I_raw = MAE RISE       (permuted - baseline, clipped ≥ 0)
     val_raw_slice = X_scaled[train_end : val_end + seq_len]
     n_val_rows    = val_end - train_end
     y_val_tf      = tf.constant(y_val)
@@ -715,25 +761,43 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
             X_perm_seqs = np.stack([X_perm_pca[k : k + seq_len]
                                     for k in range(n_val_rows)])
 
-            # ── Full-val MAE impact ────────────────────────────────────────────
-            perm_mae = _eval_mae(model, tf.constant(X_perm_seqs), y_val_tf)
-            I_raw    = max(0.0, perm_mae - baseline_mae)
+            if is_classify:
+                # ── DIRECTION: importance = accuracy drop ──────────────────────
+                perm_metric = float(_eval_accuracy(
+                    model, tf.constant(X_perm_seqs), y_val_tf).numpy())
+                I_raw = max(0.0, baseline_metric - perm_metric)
 
-            # ── Regime stability: consistency of importance across bull/bear ───
-            # I_bull / I_bear: MAE increase when feature is permuted, per regime.
-            # Stability = 1 - |I_bull - I_bear| / (I_bull + I_bear + ε)
-            # → 1.0 if feature equally important in both regimes
-            # → 0.0 if feature only matters in one regime (regime-fragile signal)
-            if has_bull and has_bear:
-                perm_bull = _eval_mae(model, tf.constant(X_perm_seqs[bull_mask]),
-                                      tf.constant(y_bull))
-                perm_bear = _eval_mae(model, tf.constant(X_perm_seqs[bear_mask]),
-                                      tf.constant(y_bear))
-                I_bull    = max(0.0, perm_bull - baseline_mae_bull)
-                I_bear    = max(0.0, perm_bear - baseline_mae_bear)
-                stability = 1.0 - abs(I_bull - I_bear) / (I_bull + I_bear + 1e-9)
+                # ── Regime stability ───────────────────────────────────────────
+                if has_bull and has_bear:
+                    perm_bull = float(_eval_accuracy(
+                        model, tf.constant(X_perm_seqs[bull_mask]),
+                        tf.constant(y_bull)).numpy())
+                    perm_bear = float(_eval_accuracy(
+                        model, tf.constant(X_perm_seqs[bear_mask]),
+                        tf.constant(y_bear)).numpy())
+                    I_bull    = max(0.0, baseline_bull - perm_bull)
+                    I_bear    = max(0.0, baseline_bear - perm_bear)
+                    stability = 1.0 - abs(I_bull - I_bear) / (I_bull + I_bear + 1e-9)
+                else:
+                    stability = 0.5   # neutral — single-regime data
             else:
-                stability = 0.5   # neutral — single-regime data
+                # ── EASE/EXP: importance = MAE rise ───────────────────────────
+                perm_metric = _eval_mae(model, tf.constant(X_perm_seqs), y_val_tf)
+                I_raw = max(0.0, perm_metric - baseline_metric)
+
+                # ── Regime stability ───────────────────────────────────────────
+                if has_bull and has_bear:
+                    perm_bull = _eval_mae(model,
+                                         tf.constant(X_perm_seqs[bull_mask]),
+                                         tf.constant(y_bull))
+                    perm_bear = _eval_mae(model,
+                                         tf.constant(X_perm_seqs[bear_mask]),
+                                         tf.constant(y_bear))
+                    I_bull    = max(0.0, perm_bull - baseline_bull)
+                    I_bear    = max(0.0, perm_bear - baseline_bear)
+                    stability = 1.0 - abs(I_bull - I_bear) / (I_bull + I_bear + 1e-9)
+                else:
+                    stability = 0.5   # neutral — single-regime data
 
             report_rows.append({
                 'Feature':     feat_name,
