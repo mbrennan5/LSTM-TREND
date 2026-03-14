@@ -10,6 +10,7 @@
 #   7. generate_expansion_target removed — EXP target is inline look-forward
 # =============================================================================
 import os, gc, re, numpy as np, pandas as pd, yfinance as yf, random
+from scipy import signal as sp_signal
 from datetime import datetime
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
@@ -190,28 +191,99 @@ def generate_heavy_physics(df):
         lambda x: np.polyfit(np.arange(len(x)), x, 2)[0] if len(x) > 2 else 0.0,
         raw=True).values
 
+    # ── Aroon Up (25) ─────────────────────────────────────────────────────────
+    aroon_up_25 = pd.Series(hi).rolling(25).apply(
+        lambda x: float(np.argmax(x)) / 25, raw=True).values
+
+    # ── Multi-period Shannon entropy ──────────────────────────────────────────
+    shannon_10 = _rolling_shannon(hlc, 10)
+    shannon_20 = _rolling_shannon(hlc, 20)
+    shannon_40 = _rolling_shannon(hlc, 40)
+
+    # ── Dominant cycle (spectral peak period, window=20) ─────────────────────
+    def _dominant_cycle(x):
+        x = x - x.mean()
+        if np.all(x == 0): return np.nan
+        f, pxx = sp_signal.periodogram(x)
+        if len(f) < 2: return np.nan
+        peak = pxx[1:].argmax() + 1
+        return 1.0 / f[peak] if f[peak] > 0 else np.nan
+    dominant_cycle_20 = pd.Series(hlc).rolling(20).apply(_dominant_cycle, raw=True).values
+
+    # ── Price MA percentages ──────────────────────────────────────────────────
+    tema_30_pct = hlc / (tema_30 + 1e-9) - 1
+    sma_20_pct  = hlc / (sma_20  + 1e-9) - 1
+    hma_21_pct  = hlc / (hma_21  + 1e-9) - 1
+
     # ── Log-Stabilized Ratios ─────────────────────────────────────────────────
-    _lr = lambda n, d: np.sign(n / (d+1e-9)) * (np.log(np.abs(n)+1e-9) - np.log(np.abs(d)+1e-9))
-    ratio_acc       = _lr(slope_10, slope_20)
-    ratio_snr       = _lr(slope_20, atr_14)
-    ratio_eff_slope = np.sign(slope_20) * np.log(np.abs(slope_20 * er_20) + 1e-9)
-    ratio_struct    = np.log(r_sq_20 + 1e-9) - np.log(_rolling_shannon(hlc, 20) + 1e-9)
-    exhaustion_60   = np.log(cl + 1e-9) - np.log(pd.Series(hi).rolling(60).max().values + 1e-9)
+    _lrat = lambda n, d: np.sign(n / (d+1e-9)) * (np.log(np.abs(n)+1e-9) - np.log(np.abs(d)+1e-9))
+    hurst_50_arr      = _rolling_hurst(hlc, 50)
+    ratio_acc         = _lrat(slope_10, slope_20)
+    ratio_snr         = _lrat(slope_20, atr_14)
+    ratio_eff_slope   = np.sign(slope_20) * np.log(np.abs(slope_20 * er_20) + 1e-9)
+    ratio_pers_slope  = slope_30 * hurst_50_arr                          # persistence-weighted slope
+    ratio_struct      = np.log(r_sq_20 + 1e-9) - np.log(shannon_20 + 1e-9)
+    kalman_sma_ratio  = kalman / (sma_30 + 1e-9)
+    tema_kalman_ratio = tema_30 / (kalman + 1e-9)
+    curvature_diff    = slope_10 - slope_30
+    exhaustion_60     = np.log(cl + 1e-9) - np.log(pd.Series(hi).rolling(60).max().values + 1e-9)
+    logistic_prob_30  = 1.0 / (1.0 + np.exp(-slope_30 / (np.nanstd(slope_30) + 1e-9)))
+
+    # cycle_vs_trend: long dominant cycle + low ADX = range-bound cyclic regime
+    cycle_vs_trend    = dominant_cycle_20 / (adx_14 + 1e-9)
+
+    # Donchian breakout signal / efficiency ratio
+    _hi_s = pd.Series(hi); _lo_s = pd.Series(lo)
+    don_bo = np.where(_hi_s >= _hi_s.rolling(20).max(), 1.0,
+             np.where(_lo_s <= _lo_s.rolling(20).min(), -1.0, 0.0)).astype(np.float64)
+    ratio_breakout_eff = don_bo / (er_20 + 1e-9)
+
+    adx_entropy_ratio  = adx_14 / (shannon_20 + 1e-9)
 
     # ── Z-Lens Integration ────────────────────────────────────────────────────
     Z_CORE = {
-        'er_20':            er_20,
-        'r_sq_30':          r_sq_30,
-        'hurst_50':         _rolling_hurst(hlc, 50),
-        'shannon_20':       _rolling_shannon(hlc, 20),
-        'adx_14':           adx_14,
-        'lr_slope_10':      slope_10,
-        'lr_weighted_30':   weighted_trend_30,
-        'kalman_pct':       (hlc / kalman - 1),
-        'ratio_acc':        ratio_acc,
-        'curvature_diff':   (slope_10 - slope_30),
-        'exhaustion_60':    exhaustion_60,
-        'donchian_high_50': donchian_high_50,
+        # Bounded oscillators
+        'er_20':              er_20,
+        'er_10':              er_10,
+        'vidya_cmo_20':       vidya_cmo_20,
+        'r_sq_30':            r_sq_30,
+        'r_sq_20':            r_sq_20,
+        'hurst_50':           hurst_50_arr,
+        'shannon_20':         shannon_20,
+        'shannon_10':         shannon_10,
+        'shannon_40':         shannon_40,
+        'adx_14':             adx_14,
+        'logistic_prob_30':   logistic_prob_30,
+        'aroon_up_25':        aroon_up_25,
+        'donchian_high_50':   donchian_high_50,
+        'donchian_high_20':   donchian_high_20,
+        'dispersion_30':      dispersion_30,
+        'quadratic_a_20':     quadratic_a_20,
+        'dominant_cycle_20':  dominant_cycle_20,
+        # Price MA ratios (mean-reverting around zero)
+        'tema_30_pct':        tema_30_pct,
+        'sma_20_pct':         sma_20_pct,
+        'hma_21_pct':         hma_21_pct,
+        'kalman_pct':         (hlc / kalman - 1),
+        # Slopes
+        'lr_slope_10':        slope_10,
+        'lr_slope_20':        slope_20,
+        'lr_slope_30':        slope_30,
+        'lr_slope_60':        slope_60,
+        'lr_weighted_30':     weighted_trend_30,
+        # Ratios
+        'ratio_acc':          ratio_acc,
+        'ratio_snr':          ratio_snr,
+        'ratio_eff_slope':    ratio_eff_slope,
+        'ratio_pers_slope':   ratio_pers_slope,
+        'ratio_struct':       ratio_struct,
+        'kalman_sma_ratio':   kalman_sma_ratio,
+        'tema_kalman_ratio':  tema_kalman_ratio,
+        'curvature_diff':     curvature_diff,
+        'cycle_vs_trend':     cycle_vs_trend,
+        'ratio_breakout_eff': ratio_breakout_eff,
+        'adx_entropy_ratio':  adx_entropy_ratio,
+        'exhaustion_60':      exhaustion_60,
     }
     for name, data in Z_CORE.items():
         s = pd.Series(data)
