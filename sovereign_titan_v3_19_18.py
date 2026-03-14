@@ -601,7 +601,7 @@ def _eval_mae(model, X_batch, y_batch):
 WARMUP_ROWS = 350  # first N rows have unreliable indicator values — excluded from fits
 
 def run_judicial_audit(brain_name, master_df, model_type='GRU',
-                       seq_len=30, epochs=60, batch_size=2048):
+                       seq_len=30, epochs=60, batch_size=2048, look_fwd=5):
     # ── Brain mandate: enforce architecture per md5 spec ──────────────────────
     # DIRECTION → GRU + classify;  EASE / EXP → LSTM + regress
     # The caller's model_type hint is overridden to keep architecture compliant.
@@ -615,12 +615,29 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
     N_COMPS = min(N_PCA_COMPONENTS, n_raw)   # safety: can't exceed raw count
 
     X_raw = master_df[feature_cols].values
-    # DIRECTION: binarise target (up day = 1, down/flat = 0)
-    # EASE/EXP:  use raw continuous value
-    if is_classify:
-        y_raw = (master_df['T_FINAL'].values > 0).astype(np.float32)
-    else:
-        y_raw = master_df['T_FINAL'].values.astype(np.float32)
+
+    # ── Look-forward targets — computed per brain from OHLC ───────────────────
+    cl_s = pd.Series(master_df['close'].values)
+    hi_s = pd.Series(master_df['high'].values)
+    lo_s = pd.Series(master_df['low'].values)
+    tr   = np.maximum((hi_s - lo_s).values,
+                      np.maximum(np.abs((hi_s - cl_s.shift(1))).values,
+                                 np.abs((lo_s - cl_s.shift(1))).values))
+    atr_14_y = pd.Series(tr).rolling(14).mean()
+
+    if brain_name == 'DIRECTION':
+        # Binary: did price close higher LOOK_FWD days from now?
+        y_raw = (cl_s.shift(-look_fwd) > cl_s).astype(np.float32).values
+
+    elif brain_name == 'EXP':
+        # Expansion: max range over next LOOK_FWD bars / ATR-14
+        fwd_hi = hi_s[::-1].rolling(look_fwd).max()[::-1]
+        fwd_lo = lo_s[::-1].rolling(look_fwd).min()[::-1]
+        y_raw  = ((fwd_hi - fwd_lo) / (atr_14_y + 1e-9)).values.astype(np.float32)
+
+    else:  # EASE
+        # Continuous forward log-return over LOOK_FWD days
+        y_raw = np.log(cl_s.shift(-look_fwd) / (cl_s + 1e-9)).values.astype(np.float32)
     n     = len(X_raw)
     n_seq = n - seq_len
 
@@ -1005,8 +1022,9 @@ print("\n--- SOVEREIGN TITAN v3.19.18 — GPU + SPEED EDITION v2 ---")
 choice        = input("Select Brain (1:DIR / 2:EASE / 3:EXP / 4:ALL): ")
 BRAINS_TO_RUN = (['DIRECTION', 'EASE', 'EXP'] if choice == '4'
                  else [{'1': 'DIRECTION', '2': 'EASE', '3': 'EXP'}[choice]])
-num_symbols   = int(input("Symbols per iteration (Default 50): ") or "50")
-num_iters     = int(input("Iterations to run (Default 25): ")     or "25")
+num_symbols   = int(input("Symbols per iteration (Default 50): ")  or "50")
+num_iters     = int(input("Iterations to run (Default 25): ")      or "25")
+LOOK_FWD      = int(input("Look-forward days (Default 5): ")       or "5")
 
 final_report_accumulator = []
 
@@ -1027,7 +1045,8 @@ for BRAIN in BRAINS_TO_RUN:
             continue
 
         report_raw = run_judicial_audit(BRAIN, master_df,
-                                        model_type=CURRENT_MODEL_TYPE)
+                                        model_type=CURRENT_MODEL_TYPE,
+                                        look_fwd=LOOK_FWD)
         if report_raw.empty:
             print("  ⚠️  Quality gate — iteration skipped.")
             continue
