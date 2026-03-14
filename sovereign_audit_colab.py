@@ -27,15 +27,40 @@ plt.rcParams.update({"figure.dpi": 130, "axes.spines.top": False,
 SEARCH_ROOT = "/content/drive/MyDrive"          # ← change if needed
 N_FEATURES  = 19                                 # slots per brain
 
-# Auto-detect the most recent Sovereign_Audit_Master CSV
-candidates = sorted(
-    glob.glob(f"{SEARCH_ROOT}/**/Sovereign_Audit_Master*.csv", recursive=True),
-    key=os.path.getmtime, reverse=True
-)
+# ── Fast path: check judicial_results/ first (titan always writes here) ───────
+# Avoids a full recursive Drive scan which can spin for minutes on large accounts.
+_JUDICIAL_DIR = os.path.join(SEARCH_ROOT, "judicial_results")
+candidates = []
+
+if os.path.exists(_JUDICIAL_DIR):
+    candidates = sorted(
+        glob.glob(os.path.join(_JUDICIAL_DIR, "**", "Sovereign_Audit_Master*.csv"),
+                  recursive=True),
+        key=os.path.getmtime, reverse=True
+    )
+
+# ── Fallback: top-level Drive only (no deep recursion) ───────────────────────
+if not candidates:
+    candidates = sorted(
+        glob.glob(os.path.join(SEARCH_ROOT, "Sovereign_Audit_Master*.csv")),
+        key=os.path.getmtime, reverse=True
+    )
+
+# ── Last resort: full recursive scan (slow — may spin on large drives) ────────
+if not candidates:
+    print("⚠️  Fast search found nothing — falling back to full Drive scan (may be slow)...")
+    candidates = sorted(
+        glob.glob(os.path.join(SEARCH_ROOT, "**", "Sovereign_Audit_Master*.csv"),
+                  recursive=True),
+        key=os.path.getmtime, reverse=True
+    )
+
 if not candidates:
     raise FileNotFoundError(
-        "No Sovereign_Audit_Master*.csv found under "
-        f"{SEARCH_ROOT}\nCheck your Drive folder or set SEARCH_ROOT."
+        "No Sovereign_Audit_Master*.csv found.\n"
+        f"  Searched: {_JUDICIAL_DIR}/**\n"
+        f"            {SEARCH_ROOT}/*.csv\n"
+        "  Set SEARCH_ROOT to your output folder or pass CSV_PATH directly."
     )
 
 CSV_PATH = candidates[0]
