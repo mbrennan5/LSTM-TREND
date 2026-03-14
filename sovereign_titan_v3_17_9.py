@@ -229,19 +229,26 @@ def generate_heavy_physics(df):
     # ── Hurst (50) ────────────────────────────────────────────────────────────
     hurst_50 = _rolling_hurst(hlc, 50)
 
-    # ── Ratios (simple — exact spec) ─────────────────────────────────────────
-    ratio_acc         = slope_10  / (slope_20     + 1e-9)
-    ratio_snr         = slope_20  / (atr_14       + 1e-9)
-    ratio_eff_slope   = slope_20  *  er_20
-    ratio_pers_slope  = slope_20  *  hurst_50
-    ratio_struct      = r_sq_20   / (shannon_20   + 1e-9)
-    kalman_sma_ratio  = kalman    / (sma_20       + 1e-9)
-    tema_kalman_ratio = tema_30   / (kalman       + 1e-9)
-    curvature_diff    = slope_10  -  slope_60
-    cycle_vs_trend    = dominant_cycle_20 / (linreg_30 + 1e-9)
-    ratio_breakout_eff = donchian_high_20 / (er_20    + 1e-9)
-    adx_entropy_ratio = adx_14    / (shannon_20   + 1e-9)
-    exhaustion_60     = cl        / (hi_s.rolling(60).max().values + 1e-9)
+    # ── Ratios — log-stabilised to compress outliers before z-scoring ─────────
+    # _lrat(n, d)  = sign(n/d) * log(|n/d|)   robust to extreme denominators
+    # _lprod(n, d) = sign(n)   * log(|n*d| + ε)  for products
+    # _ldiff(x)    = sign(x)   * log(|x|   + ε)  for differences
+    _lrat  = lambda n, d: np.sign(n / (d + 1e-9)) * (np.log(np.abs(n) + 1e-9) - np.log(np.abs(d) + 1e-9))
+    _lprod = lambda n, d: np.sign(n) * np.log(np.abs(n * d) + 1e-9)
+    _ldiff = lambda x:    np.sign(x) * np.log(np.abs(x)     + 1e-9)
+
+    ratio_acc         = _lrat(slope_10,  slope_20)
+    ratio_snr         = _lrat(slope_20,  atr_14)
+    ratio_eff_slope   = _lprod(slope_20, er_20)
+    ratio_pers_slope  = _lprod(slope_20, hurst_50)
+    ratio_struct      = _lrat(r_sq_20,   shannon_20)
+    kalman_sma_ratio  = _lrat(kalman,    sma_20)
+    tema_kalman_ratio = _lrat(tema_30,   kalman)
+    curvature_diff    = _ldiff(slope_10  - slope_60)
+    cycle_vs_trend    = _lrat(dominant_cycle_20, linreg_30)
+    ratio_breakout_eff = _lrat(donchian_high_20, er_20)
+    adx_entropy_ratio = _lrat(adx_14,    shannon_20)
+    exhaustion_60     = _lrat(cl,        hi_s.rolling(60).max().values)
 
     # ── Z-Lens Integration (40 features × 3 lengths × 3 transforms = 360 cols)
     Z_LENS_INDICATORS = {
