@@ -271,8 +271,11 @@ def generate_factory_features_v2(df):
     hurst_50   = _rolling_hurst(hlc, 50)
     shannon_20 = _rolling_shannon(hlc, 20)
     cog_20     = _rolling_cog(hlc, 20)
-    # linreg computed ONCE (duplicate removed)
+    # ── Multi-window linear slopes ────────────────────────────────────────────
+    linreg_10        = _rolling_linslope(hlc, 10)
+    linreg_20        = _rolling_linslope(hlc, 20)
     linreg_30        = _rolling_linslope(hlc, 30)
+    linreg_60        = _rolling_linslope(hlc, 60)
     slope_std        = np.nanstd(linreg_30) + 1e-9
     logistic_prob_30 = 1.0 / (1.0 + np.exp(-linreg_30 / slope_std))
     # ── MTSI (Modified True Strength Index via VWAP anchor) ───────────────────
@@ -306,12 +309,14 @@ def generate_factory_features_v2(df):
     dispersion_30 = np.std(np.stack([d_sma, d_tema, d_kal], axis=1), axis=1)
     # ── Donchian / Aroon ──────────────────────────────────────────────────────
     hi_s             = pd.Series(hi, index=idx)
+    donchian_high_20 = (hi_s / hi_s.rolling(20).max() - 1).values
     donchian_high_50 = (hi_s / hi_s.rolling(50).max() - 1).values
     aroon_up_25      = hi_s.rolling(25).apply(
         lambda x: float(np.argmax(x)) / 25, raw=True
     ).values
     # ── Pre-transform Price MAs: hlc3 / MA - 1 ────────────────────────────────
     tema_10_pct = hlc / (tema_10 + 1e-9) - 1
+    tema_30_pct = hlc / (tema_30 + 1e-9) - 1
     sma_5_pct   = hlc / (sma_5   + 1e-9) - 1
     sma_20_pct  = hlc / (sma_20  + 1e-9) - 1
     hma_21_pct  = hlc / (hma_21  + 1e-9) - 1
@@ -325,15 +330,24 @@ def generate_factory_features_v2(df):
     kalman_sma_ratio   = kalman  / (sma_20  + 1e-9) - 1
     tema_kalman_ratio  = tema_30 / (kalman  + 1e-9) - 1
     exhaustion         = (hlc - kalman) / (atr_14   + 1e-9)
-    ratio_acc          = _rolling_linslope(er_20,  10)
-    ratio_snr          = r_sq_30 / (1.0 - r_sq_30 + 1e-9)
-    curvature_diff     = _rolling_linslope(ema10, 10) - _rolling_linslope(ema30, 10)
+    # exhaustion_60: scale-invariant distance from 60-bar high (Tier 1)
+    _hi60 = pd.Series(hlc, index=idx).rolling(60).max().values
+    _lo60 = pd.Series(hlc, index=idx).rolling(60).min().values
+    exhaustion_60      = (_hi60 - hlc) / (_hi60 - _lo60 + 1e-9)
+    # ratio_acc: slope acceleration — fast slope / slow slope (slope_10 / slope_20)
+    ratio_acc          = linreg_10 / (np.abs(linreg_20) + 1e-9) * np.sign(linreg_20)
+    # ratio_snr: signal-to-noise — slope magnitude / ATR noise (slope_20 / ATR_14)
+    ratio_snr          = np.abs(linreg_20) / (atr_14 + 1e-9)
+    # curvature_diff: second-order geometry — slope_10 minus slope_60
+    curvature_diff     = linreg_10 - linreg_60
     cycle_vs_trend     = np.abs(cog_20) / (r_sq_30 + 1e-9)
     ratio_eff_slope    = er_20 * np.sign(linreg_30)
-    ratio_pers_slope   = hurst_50 * np.sign(linreg_30)
+    # ratio_pers_slope: memory-weighted velocity — Hurst-50 × slope_20
+    ratio_pers_slope   = hurst_50 * np.sign(linreg_20)
     ratio_struct       = (tema_10_pct - sma_20_pct) / (np.abs(sma_20_pct) + 1e-9)
     adx_entropy_ratio  = adx_14  / (shannon_20 + 1e-9)
-    ratio_breakout_eff = np.abs(donchian_high_50) / (er_20 + 1e-9)
+    # ratio_breakout_eff: breakout conviction — Donchian-20 / ER-20
+    ratio_breakout_eff = np.abs(donchian_high_20) / (er_20 + 1e-9)
     r_sq_hurst_ratio   = r_sq_30  / (hurst_50   + 1e-9)
     vhf_adx_ratio      = vhf_28   / (adx_14     + 1e-9)
     # ── Z-lens group ──────────────────────────────────────────────────────────
@@ -350,6 +364,7 @@ def generate_factory_features_v2(df):
         'dispersion_30':    pd.Series(dispersion_30,    index=idx),
         'lr_slope_30':      pd.Series(linreg_30,        index=idx),
         'tema_10_pct':      pd.Series(tema_10_pct,      index=idx),
+        'tema_30_pct':      pd.Series(tema_30_pct,      index=idx),
         'sma_5_pct':        pd.Series(sma_5_pct,        index=idx),
         'sma_20_pct':       pd.Series(sma_20_pct,       index=idx),
         'hma_21_pct':       pd.Series(hma_21_pct,       index=idx),
@@ -357,6 +372,7 @@ def generate_factory_features_v2(df):
         'kalman_sma_ratio':    pd.Series(kalman_sma_ratio,    index=idx),
         'tema_kalman_ratio':   pd.Series(tema_kalman_ratio,   index=idx),
         'exhaustion':          pd.Series(exhaustion,          index=idx),
+        'exhaustion_60':       pd.Series(exhaustion_60,       index=idx),
         'ratio_acc':           pd.Series(ratio_acc,           index=idx),
         'ratio_snr':           pd.Series(ratio_snr,           index=idx),
         'curvature_diff':      pd.Series(curvature_diff,      index=idx),
