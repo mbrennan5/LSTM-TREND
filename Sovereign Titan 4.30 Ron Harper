@@ -501,7 +501,7 @@ def _eval_accuracy(model, X_batch, y_batch):
                        tf.cast(y_batch, tf.int32))
     return tf.reduce_mean(tf.cast(correct, tf.float32))
 def run_judicial_audit(brain_name, master_df, model_type='GRU',
-                       seq_len=10, epochs=5, batch_size=1024):
+                       seq_len=10, epochs=25, batch_size=1024):
     feature_cols = [c for c in master_df.columns
                     if c.startswith('LENS_') or c.startswith('WIN_')]
     n_features   = len(feature_cols)
@@ -528,7 +528,7 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
         model.fit(
             train_ds, validation_data=val_ds, epochs=epochs,
             callbacks=[
-                EarlyStopping(monitor='val_loss', patience=6,
+                EarlyStopping(monitor='val_loss', patience=5,
                               restore_best_weights=True),
                 ReduceLROnPlateau(monitor='val_loss', factor=0.5,
                                   patience=3, min_lr=1e-5),
@@ -648,8 +648,8 @@ print("\n--- SOVEREIGN TITAN v3.20 — Scottie Pippen Edition ---")
 choice        = input("Select Brain (1:DIR / 2:EASE / 3:EXP / 4:ALL): ")
 BRAINS_TO_RUN = (['DIRECTION', 'EASE', 'EXP'] if choice == '4'
                  else [{'1': 'DIRECTION', '2': 'EASE', '3': 'EXP'}[choice]])
-num_symbols   = int(input("Symbols per iteration (Default 50): ") or "50")
-num_iters     = int(input("Iterations to run (Default 25): ")     or "25")
+num_symbols   = int(input("Symbols per iteration (Default 75): ") or "75")
+num_iters     = int(input("Iterations to run (Default 20): ")     or "20")
 final_report_accumulator = []
 for BRAIN in BRAINS_TO_RUN:
     CURRENT_MODEL_TYPE = 'GRU' if BRAIN == 'DIRECTION' else 'LSTM'
