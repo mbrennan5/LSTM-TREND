@@ -871,11 +871,26 @@ def main():
     # ── locate CSV ────────────────────────────────────────────────────────────
     csv_path = args.csv
     if csv_path is None:
+        # 1st: search cwd recursively
         candidates = sorted(
             glob.glob("**/Sovereign_Audit_Master*.csv", recursive=True),
             key=os.path.getmtime, reverse=True)
+        # 2nd: fall back to known Colab Google Drive output path
         if not candidates:
-            sys.exit(bad("No Sovereign_Audit_Master*.csv found. Pass the path explicitly."))
+            drive_pattern = (
+                "/content/drive/MyDrive/judicial_results/"
+                "Sovereign_Titan_v3.19.18_Entropy_Injection/Sov*.csv"
+            )
+            candidates = sorted(
+                glob.glob(drive_pattern),
+                key=os.path.getmtime, reverse=True)
+        if not candidates:
+            sys.exit(bad(
+                "No Sovereign_Audit_Master*.csv found.\n"
+                "  Searched cwd (recursive) and:\n"
+                "  /content/drive/MyDrive/judicial_results/"
+                "Sovereign_Titan_v3.19.18_Entropy_Injection/Sov*.csv\n"
+                "  Pass the path explicitly as the first argument."))
         csv_path = candidates[0]
         print(warn(f"  Auto-detected: {csv_path}"))
 

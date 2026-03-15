@@ -39,6 +39,12 @@ def check_specific(path: str):
         print(f"  {RED}✖  File not found{RESET}")
 
 
+DRIVE_PATTERN = (
+    "/content/drive/MyDrive/judicial_results/"
+    "Sovereign_Titan_v3.19.18_Entropy_Injection/Sov*.csv"
+)
+
+
 def check_auto_detect():
     print(f"\n{DIVIDER}")
     print(f"{BOLD}Auto-detect scan (mirrors sovereign_audit_assessor.py logic){RESET}")
@@ -46,16 +52,25 @@ def check_auto_detect():
 
     cwd = os.getcwd()
     print(f"  Working directory : {cwd}")
-    print(f"  Glob pattern      : **/Sovereign_Audit_Master*.csv  (recursive)")
+    print(f"  Glob pattern 1    : **/Sovereign_Audit_Master*.csv  (recursive from cwd)")
+    print(f"  Glob pattern 2    : {DRIVE_PATTERN}")
     print()
 
+    # Mirror exact two-step logic from sovereign_audit_assessor.py
     candidates = sorted(
         glob.glob("**/Sovereign_Audit_Master*.csv", recursive=True),
         key=os.path.getmtime, reverse=True
     )
+    source = "cwd"
+    if not candidates:
+        candidates = sorted(
+            glob.glob(DRIVE_PATTERN),
+            key=os.path.getmtime, reverse=True
+        )
+        source = "Google Drive"
 
     if not candidates:
-        print(f"  {RED}✖  No matches found{RESET}")
+        print(f"  {RED}✖  No matches found in either location{RESET}")
         print()
         print(f"  {YELLOW}Suggestions:{RESET}")
         print(f"    1. Make sure you have run sovereign_titan_v3_19_18.py at least once")
@@ -65,7 +80,7 @@ def check_auto_detect():
         print(f"    3. Or pass the path explicitly:")
         print(f"       python sovereign_audit_assessor.py /path/to/your/file.csv")
     else:
-        print(f"  {GREEN}✔  {len(candidates)} match(es) found:{RESET}")
+        print(f"  {GREEN}✔  {len(candidates)} match(es) found  [source: {source}]{RESET}")
         print()
         for i, p in enumerate(candidates):
             abs_p  = os.path.abspath(p)
@@ -119,21 +134,25 @@ def _peek_columns(path: str):
 
 def _scan_common_locations(cwd: str):
     """Check common places the CSV might have been saved."""
-    candidates = [
+    drive_dir = os.path.dirname(DRIVE_PATTERN)
+    dirs_to_check = [
         cwd,
         os.path.join(cwd, "output"),
         os.path.join(cwd, "results"),
         os.path.join(cwd, "data"),
         os.path.expanduser("~/Downloads"),
         os.path.expanduser("~/Desktop"),
+        drive_dir,   # Colab Google Drive output folder
     ]
     print(f"  {BOLD}Scanning common locations:{RESET}")
-    for loc in candidates:
+    for loc in dirs_to_check:
         if not os.path.isdir(loc):
             continue
-        hits = glob.glob(os.path.join(loc, "Sovereign_Audit_Master*.csv"))
+        # Use Sov*.csv for the Drive folder to match both naming conventions
+        pattern = "Sov*.csv" if loc == drive_dir else "Sovereign_Audit_Master*.csv"
+        hits = glob.glob(os.path.join(loc, pattern))
         if hits:
-            for h in hits:
+            for h in sorted(hits, key=os.path.getmtime, reverse=True):
                 size = os.path.getsize(h)
                 print(f"  {GREEN}✔  {h}  ({size:,} bytes){RESET}")
         else:
