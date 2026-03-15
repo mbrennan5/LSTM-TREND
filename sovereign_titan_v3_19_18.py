@@ -347,6 +347,37 @@ def generate_factory_features_v2(df):
         lambda x: float(np.argmax(x)) / 25, raw=True
     ).values
 
+    # ── Ratio building blocks ──────────────────────────────────────────────────
+    slope_10         = _rolling_linslope(hlc, 10)
+    slope_20         = _rolling_linslope(hlc, 20)
+    slope_60         = _rolling_linslope(hlc, 60)
+    r_sq_20          = _rolling_r_sq(hlc, 20)
+    donchian_high_20 = (hi_s / hi_s.rolling(20).max() - 1).values
+    _eps = 1e-9
+
+    # ── Log-Ratio Protocol (Sovereign Titan v4.0 mandate) ─────────────────────
+    # Category 1 — Price Anchors: log(A) − log(B)  [stationarity mandate]
+    kalman_sma_ratio  = np.log(np.abs(kalman)  + _eps) - np.log(np.abs(sma_20)  + _eps)
+    tema_kalman_ratio = np.log(np.abs(tema_30) + _eps) - np.log(np.abs(kalman)  + _eps)
+    exhaustion_60     = np.log(cl + _eps) - np.log(hi_s.rolling(60).max().values + _eps)
+
+    # Category 2 — Velocity Seeds: sign(ratio) × log(|ratio|)  [scale-invariant]
+    _ratio_acc_raw = slope_10 / (slope_20 + _eps)
+    ratio_acc      = np.sign(_ratio_acc_raw) * np.log(np.abs(_ratio_acc_raw) + _eps)
+    _ratio_snr_raw = slope_20 / (atr_14 + _eps)
+    ratio_snr      = np.sign(_ratio_snr_raw) * np.log(np.abs(_ratio_snr_raw) + _eps)
+    _curv_raw      = slope_10 - slope_60
+    curvature_diff = np.sign(_curv_raw) * np.log(np.abs(_curv_raw) + _eps)
+
+    # Category 3 — Interactions: sign(Slope) × log(|Slope × Indicator|)
+    ratio_eff_slope    = np.sign(slope_20) * np.log(np.abs(slope_20 * er_20)    + _eps)
+    ratio_pers_slope   = np.sign(slope_20) * np.log(np.abs(slope_20 * hurst_50) + _eps)
+
+    # Semi-bounded log-ratios: log(A) − log(B)
+    ratio_struct       = np.log(np.abs(r_sq_20)          + _eps) - np.log(shannon_20 + _eps)
+    adx_entropy_ratio  = np.log(np.abs(adx_14)           + _eps) - np.log(shannon_20 + _eps)
+    ratio_breakout_eff = np.log(np.abs(donchian_high_20) + _eps) - np.log(er_20      + _eps)
+
     # ══════════════════════════════════════════════════════════════════════════
     # INDICATOR CLASSIFICATION
     #
@@ -371,7 +402,7 @@ def generate_factory_features_v2(df):
     #   cog_20: Center of Gravity is in price units, unbounded.
     #           cog / rolling_mean(cog, N) - 1 measures deviation from norm.
     #
-    # TOTAL: 90 + 3 = 93 features
+    # TOTAL: (16 + 11) × 2 × 3 + 3 = 162 + 3 = 165 features
     # ══════════════════════════════════════════════════════════════════════════
 
     # ── Pre-transform Price MAs: hlc3 / MA - 1 ────────────────────────────────
@@ -401,6 +432,21 @@ def generate_factory_features_v2(df):
         'kalman_pct':       pd.Series(kalman_pct,       index=idx),
         # Price-unit oscillators — z-lens normalises cross-stock scaling
         'mtsi':             pd.Series(mtsi,             index=idx),
+        # ── Log-Ratio Protocol features (11 ratios × 2 lenses × 3 = 66 features) ──
+        # Price Anchors
+        'kalman_sma_ratio':   pd.Series(kalman_sma_ratio,   index=idx),
+        'tema_kalman_ratio':  pd.Series(tema_kalman_ratio,  index=idx),
+        'exhaustion_60':      pd.Series(exhaustion_60,      index=idx),
+        # Velocity Seeds
+        'ratio_acc':          pd.Series(ratio_acc,          index=idx),
+        'ratio_snr':          pd.Series(ratio_snr,          index=idx),
+        'curvature_diff':     pd.Series(curvature_diff,     index=idx),
+        # Interactions
+        'ratio_eff_slope':    pd.Series(ratio_eff_slope,    index=idx),
+        'ratio_pers_slope':   pd.Series(ratio_pers_slope,   index=idx),
+        'ratio_struct':       pd.Series(ratio_struct,       index=idx),
+        'adx_entropy_ratio':  pd.Series(adx_entropy_ratio,  index=idx),
+        'ratio_breakout_eff': pd.Series(ratio_breakout_eff, index=idx),
     }
 
     # ── Apply LENS 10 & 90: z, z_slope, z_sos ────────────────────────────────
