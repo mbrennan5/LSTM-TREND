@@ -19,6 +19,12 @@
 import os, gc, warnings
 warnings.filterwarnings('ignore')
 import tensorflow as tf
+# Threading MUST be configured before the TF context initialises.
+# setup_gpu() triggers context init via tf.config.list_physical_devices(),
+# so these two lines must come first. Safe to set even when GPU is used.
+_cpu_cores = max(1, (os.cpu_count() or 2))
+tf.config.threading.set_intra_op_parallelism_threads(_cpu_cores)
+tf.config.threading.set_inter_op_parallelism_threads(2)
 def setup_gpu():
     gpus = tf.config.list_physical_devices('GPU')
     if not gpus:
@@ -34,11 +40,7 @@ def setup_gpu():
     return True
 GPU_AVAILABLE = setup_gpu()
 DEVICE = '/device:GPU:0' if GPU_AVAILABLE else '/cpu:0'
-if not GPU_AVAILABLE:
-    _cpu_cores = max(1, (os.cpu_count() or 2))
-    tf.config.threading.set_intra_op_parallelism_threads(_cpu_cores)
-    tf.config.threading.set_inter_op_parallelism_threads(2)
-    print(f"[SYSTEM] CPU threading: intra={_cpu_cores}  inter=2")
+print(f"[SYSTEM] CPU threading: intra={_cpu_cores}  inter=2")
 print(f"[SYSTEM] Active compute device: {DEVICE}\n")
 # ==============================================================================
 # ### BLOCK 1: SYSTEM INITIALIZATION
