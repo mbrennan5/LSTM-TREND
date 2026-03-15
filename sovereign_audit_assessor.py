@@ -866,7 +866,7 @@ def main():
                         help="Directory for chart output (default: ./sovereign_charts)")
     parser.add_argument("--iters", type=int, default=None,
                         help="Override total iteration count used for persistence display")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()   # parse_known_args ignores Colab's -f kernel flag
 
     # ── locate CSV ────────────────────────────────────────────────────────────
     csv_path = args.csv
