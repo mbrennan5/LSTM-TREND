@@ -54,6 +54,24 @@ INDICATOR_GROUPS = {
     "Price MA Ratios": {"tema", "sma", "hma", "kalman"},
     "Price-Unit Osc":  {"mtsi"},
     "WIN Rolling COG": {"cog"},
+    # ── Log-Ratio Protocol (v4.0 mandate) ──────────────────────────────────────
+    "LR Price Anchors":  {"kalman_sma_ratio", "tema_kalman_ratio", "exhaustion"},
+    "LR Velocity Seeds": {"ratio_acc", "ratio_snr", "curvature_diff", "cycle_vs_trend"},
+    "LR Interactions":   {
+        "ratio_eff_slope", "ratio_pers_slope", "ratio_struct",
+        "adx_entropy_ratio", "ratio_breakout_eff",
+    },
+}
+
+# Physics Suite classification by transform suffix
+# Position  → _z       (where is price/signal relative to its mean?)
+# Velocity  → _z_slope (how fast is it moving?)
+# Accel     → _z_sos   (is the velocity itself accelerating?)
+PHYSICS_SUITE = {
+    "z":       "Position / Z",
+    "z_slope": "Velocity / Slope",
+    "z_sos":   "Acceleration / SOS",
+    "pct":     "WIN Rolling %",
 }
 # reverse lookup: family → group label
 _FAM_TO_GROUP = {fam: grp for grp, fams in INDICATOR_GROUPS.items() for fam in fams}
@@ -130,31 +148,63 @@ def load_csv(path: str) -> pd.DataFrame:
 
 
 # ==============================================================================
+# SCORING ENGINE
+# ==============================================================================
+def _compute_sovereign_score(grp: pd.DataFrame, num_iters: int) -> pd.DataFrame:
+    """
+    70/15/15 Sovereign Score:
+      70% — A_Impact   (normalised avg I_Norm — predictive contribution)
+      15% — Persistence (fraction of iterations survived — regime-invariance)
+      15% — A_UV       (avg uniqueness % / 100 — orthogonality insurance)
+
+    Each component is min-max normalised to [0, 1] before weighting so that
+    a high-persistence feature with zero impact cannot crowd out a lower-persistence
+    feature with strong signal (prevents 'Information Bullies').
+    """
+    g = grp.copy()
+
+    # ── Component 1: A_Impact (normalised avg I_Norm) ─────────────────────────
+    ai = g["Avg_INorm"].fillna(0.0)
+    ai_range = ai.max() - ai.min()
+    g["C_Impact"] = (ai - ai.min()) / (ai_range + 1e-9)
+
+    # ── Component 2: Persistence fraction ────────────────────────────────────
+    g["C_Persist"] = (g["Persistence"].fillna(1) / max(num_iters, 1)).clip(0, 1)
+
+    # ── Component 3: Avg UV% normalised ──────────────────────────────────────
+    uv = g["Avg_UV"].fillna(50.0) / 100.0
+    g["C_UV"] = uv.clip(0, 1)
+
+    g["Sov_Score"] = 0.70 * g["C_Impact"] + 0.15 * g["C_Persist"] + 0.15 * g["C_UV"]
+    return g
+
+
+# ==============================================================================
 # PER-BRAIN REPORT
 # ==============================================================================
-def _top_features(brain_df: pd.DataFrame, n: int = 19) -> pd.DataFrame:
-    """Aggregate by Feature and rank."""
+def _top_features(brain_df: pd.DataFrame, n: int = 19,
+                  num_iters: int = 1) -> pd.DataFrame:
+    """Aggregate by Feature, apply 70/15/15 scoring, return top-n."""
     grp = (brain_df.groupby("Feature")
            .agg(
-               Runs       = ("I_raw", "count"),
-               Avg_IRaw   = ("I_raw", "mean"),
-               Avg_INorm  = ("I_Norm", "mean"),
-               Avg_UV     = ("UV%", "mean"),
-               Max_R_avg  = ("Max_R", "mean"),
+               Runs       = ("I_raw",       "count"),
+               Avg_IRaw   = ("I_raw",       "mean"),
+               Avg_INorm  = ("I_Norm",      "mean"),
+               Avg_UV     = ("UV%",         "mean"),
+               Max_R_avg  = ("Max_R",       "mean"),
                Persistence= ("Persistence", "first"),
-               Is_Locked  = ("Is_Locked", "first"),
-               Model_Type = ("Model_Type", "first"),
+               Is_Locked  = ("Is_Locked",   "first"),
+               Model_Type = ("Model_Type",  "first"),
            )
            .reset_index())
-    # sovereign score: persistence × avg normalised importance
-    grp["Sov_Score"] = grp["Persistence"] * grp["Avg_INorm"]
+    grp = _compute_sovereign_score(grp, num_iters)
     return (grp.sort_values("Sov_Score", ascending=False)
                .head(n)
                .reset_index(drop=True))
 
 
 def report_brain(brain: str, bdf: pd.DataFrame, num_iters: int):
-    top = _top_features(bdf)
+    top = _top_features(bdf, num_iters=num_iters)
     n_feat   = bdf["Feature"].nunique()
     n_rows   = len(bdf)
     avg_imp  = bdf["I_Norm"].mean()
@@ -169,17 +219,18 @@ def report_brain(brain: str, bdf: pd.DataFrame, num_iters: int):
 
     # header
     hdr = (f"  {'RNK':<4} {'FEATURE':<40} {'PERSIST':>7} "
-           f"{'AVG_IMP':>8} {'SOV_SCR':>8} {'LK':>4}")
+           f"{'AVG_IMP':>8} {'AVG_UV%':>8} {'SOV_715':>8} {'LK':>4}")
     print(hdr)
-    print("  " + "─" * 68)
+    print("  " + "─" * 78)
 
     for i, row in top.iterrows():
         lock_icon = "🔒" if row["Is_Locked"] else "  "
         persist_s = f"{int(row['Persistence'])}/{num_iters}"
         color     = GREEN if row["Is_Locked"] else RESET
+        uv_s      = f"{row['Avg_UV']:.1f}" if pd.notna(row["Avg_UV"]) else "  —  "
         line = (f"  {i+1:02d}.  {color}{row['Feature']:<40}{RESET} "
                 f"{persist_s:>7}  {row['Avg_INorm']:>8.4f}  "
-                f"{row['Sov_Score']:>8.4f}  {lock_icon}")
+                f"{uv_s:>8}  {row['Sov_Score']:>8.4f}  {lock_icon}")
         print(line)
 
     print()
@@ -432,12 +483,28 @@ def report_risk_flags(df: pd.DataFrame):
             if lk not in all_features:
                 flags.append(bad(f"  ✖  BRAIN_LOCK '{lk}' ({brain}) not found in CSV"))
 
-    # WIN rolling group — expect all 3 windows
-    expected_win = {"WIN_10_cog_20_pct", "WIN_30_cog_20_pct", "WIN_90_cog_20_pct"}
+    # WIN rolling group — expect all 3 windows (factory uses 10/30/60)
+    expected_win = {"WIN_10_cog_20_pct", "WIN_30_cog_20_pct", "WIN_60_cog_20_pct"}
     missing_win  = expected_win - all_features
     if missing_win:
         flags.append(warn(f"  ⚠  WIN rolling COG features missing: "
                           f"{', '.join(sorted(missing_win))}"))
+
+    # log-ratio families — check at least one ratio feature made it through
+    ratio_families = {
+        "kalman_sma_ratio", "tema_kalman_ratio", "exhaustion",
+        "ratio_acc", "ratio_snr", "curvature_diff", "cycle_vs_trend",
+        "ratio_eff_slope", "ratio_pers_slope", "ratio_struct",
+        "adx_entropy_ratio", "ratio_breakout_eff",
+    }
+    found_ratio_fams = {
+        parse_feature(f)["family"]
+        for f in all_features
+        if parse_feature(f)["family"] in ratio_families
+    }
+    if not found_ratio_fams:
+        flags.append(warn("  ⚠  No Log-Ratio Protocol features found — "
+                          "check factory ran v3.19.18+"))
 
     # LENS parity — every LENS_10 feature should have a LENS_90 counterpart
     l10 = {f for f in all_features if f.startswith("LENS_10_")}
@@ -470,30 +537,188 @@ def report_risk_flags(df: pd.DataFrame):
 
 
 # ==============================================================================
-# SOVEREIGN SCORE SUMMARY TABLE
+# VITALITY GATE
 # ==============================================================================
-def report_sovereign_summary(df: pd.DataFrame, num_iters: int):
+def report_vitality_gate(df: pd.DataFrame, num_iters: int):
+    """
+    Best Practice #1: Audit Vitality Gate
+    ─ Mean I_Norm of top-19 per brain must be > 0.05  (signal floor)
+    ─ Mean I_Norm > 0.90 triggers a leakage warning
+    ─ Alpha Pillars: features surviving ≥ 80% of iterations
+    """
     print(f"\n{DIVIDER}")
-    print(h("  SOVEREIGN SCORE SUMMARY (all brains, top 25)"))
+    print(h("  AUDIT VITALITY GATE  (Best Practice #1 & #2)"))
     print(DIVIDER)
 
-    grp = (df.groupby(["Brain","Feature"])
-             .agg(
-                 Persistence = ("Persistence","first"),
-                 Avg_INorm   = ("I_Norm","mean"),
-                 Avg_UV      = ("UV%","mean"),
-             )
-             .reset_index())
-    grp["Sov_Score"] = grp["Persistence"] * grp["Avg_INorm"]
-    top = grp.sort_values("Sov_Score", ascending=False).head(25).reset_index(drop=True)
+    alpha_threshold = 0.80 * num_iters   # 80% persistence floor for Alpha Pillars
 
-    print(f"\n  {'RNK':<4} {'BRAIN':<12} {'FEATURE':<40} {'PERSIST':>7} "
-          f"{'AVG_IMP':>8} {'SOV_SCR':>8}")
-    print("  " + "─" * 82)
-    for i, row in top.iterrows():
-        persist_s = f"{int(row['Persistence'])}/{num_iters}"
-        print(f"  {i+1:02d}.  {row['Brain']:<12} {row['Feature']:<40} "
-              f"{persist_s:>7}  {row['Avg_INorm']:>8.4f}  {row['Sov_Score']:>8.4f}")
+    for brain in sorted(df["Brain"].unique()):
+        bdf = df[df["Brain"] == brain]
+        top = _top_features(bdf, n=19, num_iters=num_iters)
+        mean_imp = top["Avg_INorm"].mean()
+        max_imp  = top["Avg_INorm"].max()
+
+        if mean_imp < 0.05:
+            gate_icon = bad("✖  FAIL")
+            gate_note = "Model found no signal — feature seeds are noisy for this task."
+        elif mean_imp > 0.90:
+            gate_icon = warn("⚠  LEAKAGE?")
+            gate_note = "Signals this powerful rarely exist in non-lagged price data."
+        else:
+            gate_icon = ok("✔  PASS")
+            gate_note = "Signal floor healthy."
+
+        alpha_pillars = top[top["Persistence"] >= alpha_threshold]
+        model_note = ("GRU — target Directional Hit Rate 52–60%"
+                      if brain == "DIRECTION"
+                      else "LSTM — target MAE ≈ 0.014")
+
+        print(f"\n  {h(brain)}  [{model_note}]")
+        print(f"    Mean I_Norm (top-19) : {mean_imp:.4f}   Max: {max_imp:.4f}   "
+              f"→ {gate_icon}  {gate_note}")
+        print(f"    Alpha Pillars (≥{alpha_threshold:.0f}/{num_iters} iters): "
+              f"{len(alpha_pillars)} features")
+        for _, r in alpha_pillars.iterrows():
+            pct = r["Persistence"] / num_iters * 100
+            print(f"      ⭐  {r['Feature']:<42} persist={r['Persistence']:.0f}/{num_iters}"
+                  f" ({pct:.0f}%)  imp={r['Avg_INorm']:.4f}")
+
+
+# ==============================================================================
+# FINAL SOVEREIGN SCORING TABLE  (70/15/15)
+# ==============================================================================
+def _redundancy_cull(grp: pd.DataFrame) -> pd.DataFrame:
+    """
+    Best Practice #4: Redundancy Cull
+    For each indicator family, only the window (LENS_10 vs LENS_90 etc.)
+    with the highest A_Impact survives. Lower-impact duplicates are flagged.
+    Transforms (_z, _z_slope, _z_sos) of the winning window are preserved.
+    """
+    # Extract family and window from feature names using the existing parser
+    parsed = grp["Feature"].apply(parse_feature).apply(pd.Series)
+    grp = grp.copy()
+    grp["_family"]  = parsed["family"].values
+    grp["_lens"]    = parsed["lens"].values
+    grp["_window"]  = parsed["window"].values
+    grp["_suffix"]  = parsed["suffix"].values
+
+    # For LENS features: per family, find the window with highest avg A_Impact
+    lens_mask = grp["_lens"].notna()
+    culled_flags = pd.Series(False, index=grp.index)
+
+    if lens_mask.any():
+        lens_grp = grp[lens_mask].copy()
+        # best window per family = the lens value with highest avg Avg_INorm
+        best_window = (lens_grp.groupby("_family")
+                       .apply(lambda x: x.groupby("_lens")["Avg_INorm"].mean().idxmax())
+                       .to_dict())
+        # flag any row whose lens is NOT the best for its family
+        def _is_culled(row):
+            fam = row["_family"]
+            if fam in best_window and pd.notna(row["_lens"]):
+                return int(row["_lens"]) != best_window[fam]
+            return False
+        for idx, row in lens_grp.iterrows():
+            culled_flags.at[idx] = _is_culled(row)
+
+    grp["_culled"] = culled_flags
+    return grp
+
+
+def _physics_suite(suffix: str) -> str:
+    return PHYSICS_SUITE.get(str(suffix).lower(), "Other")
+
+
+def report_sovereign_summary(df: pd.DataFrame, num_iters: int):
+    """
+    Best Practices #3 + #4 + #5 combined:
+    ─ 70/15/15 Sovereign Score
+    ─ Redundancy Cull (flag duplicate-window same-family features)
+    ─ Physics Suite categorisation (Position / Velocity / Acceleration)
+    ─ Family diversity health check (≥5 unique seeds required)
+    ─ Brain-specific performance notes
+    """
+    print(f"\n{DIVIDER}")
+    print(h("  FINAL SOVEREIGN SCORING TABLE  (70% Impact · 15% Persist · 15% UV%)"))
+    print(DIVIDER)
+    print(f"  Scoring formula: Sov = 0.70×A_Impact_norm + 0.15×Persist_frac + 0.15×UV_norm")
+    print(f"  Redundancy cull: per family → keep window with highest A_Impact only")
+    print()
+
+    all_final = []
+
+    for brain in sorted(df["Brain"].unique()):
+        bdf = df[df["Brain"] == brain]
+
+        # aggregate
+        grp = (bdf.groupby("Feature")
+               .agg(
+                   Persistence = ("Persistence", "first"),
+                   Avg_INorm   = ("I_Norm",       "mean"),
+                   Avg_UV      = ("UV%",           "mean"),
+                   Max_R_avg   = ("Max_R",         "mean"),
+                   Is_Locked   = ("Is_Locked",     "first"),
+               )
+               .reset_index())
+        grp = _compute_sovereign_score(grp, num_iters)
+        grp = _redundancy_cull(grp)
+        grp["Brain"] = brain
+
+        # sort by score descending, culled features pushed to bottom
+        grp = grp.sort_values(["_culled", "Sov_Score"], ascending=[True, False])
+        top = grp.head(19).reset_index(drop=True)
+        all_final.append(top)
+
+        alpha_thresh = 0.80 * num_iters
+        brain_target = ("GRU → Hit Rate 52-60%"
+                        if brain == "DIRECTION"
+                        else "LSTM → MAE ≈ 0.014")
+
+        # unique seed families in top-19
+        parsed_top = top["Feature"].apply(parse_feature).apply(pd.Series)
+        unique_seeds = parsed_top["family"].nunique()
+        diversity_ok = unique_seeds >= 5
+        diversity_icon = ok(f"✔ {unique_seeds} seeds") if diversity_ok else warn(f"⚠ {unique_seeds} seeds (<5)")
+
+        print(f"\n  {'─'*74}")
+        print(h(f"  BRAIN: {brain}   [{brain_target}]   Family diversity: {diversity_icon}"))
+        print(f"  {'─'*74}")
+        print(f"  {'RNK':<4} {'FEATURE':<42} {'SUITE':<22} {'PERS%':>6} "
+              f"{'IMP':>6} {'UV%':>6} {'SOV':>7} {'FLAG'}")
+        print(f"  {'─'*100}")
+
+        suite_counts = {"Position / Z": 0, "Velocity / Slope": 0,
+                        "Acceleration / SOS": 0, "WIN Rolling %": 0}
+
+        for i, row in top.iterrows():
+            lock_icon  = "🔒" if row["Is_Locked"] else "  "
+            cull_icon  = warn(" ✂CULL") if row["_culled"] else ""
+            alpha_icon = " ⭐" if row["Persistence"] >= alpha_thresh else ""
+            persist_pct = row["Persistence"] / num_iters * 100
+            suite      = _physics_suite(row["_suffix"])
+            uv_s       = f"{row['Avg_UV']:>5.1f}" if pd.notna(row["Avg_UV"]) else "  —  "
+
+            if suite in suite_counts:
+                suite_counts[suite] += 1
+
+            flag_str = f"{lock_icon}{alpha_icon}{cull_icon}"
+            print(f"  {i+1:02d}.  {row['Feature']:<42} {suite:<22} "
+                  f"{persist_pct:>5.0f}%  {row['Avg_INorm']:>6.4f}  "
+                  f"{uv_s}  {row['Sov_Score']:>7.4f}  {flag_str}")
+
+        # Physics Suite summary
+        print(f"\n  Physics Suite breakdown:")
+        for suite_name, cnt in suite_counts.items():
+            bar = "█" * cnt
+            print(f"    {suite_name:<22} {cnt:>2}  {bar}")
+
+        # Unique family list
+        print(f"\n  Unique indicator seeds in final-19:")
+        for fam in sorted(parsed_top["family"].unique()):
+            grp_label = _FAM_TO_GROUP.get(fam, "Other")
+            print(f"    {fam:<30} [{grp_label}]")
+
+    return all_final
 
 
 # ==============================================================================
@@ -512,12 +737,12 @@ def save_charts(df: pd.DataFrame, out_dir: str, num_iters: int):
     fig, axes = plt.subplots(1, n, figsize=(8 * n, 6), squeeze=False)
     for ax, brain in zip(axes[0], brains):
         bdf  = df[df["Brain"] == brain]
-        top  = _top_features(bdf, n=10)
+        top  = _top_features(bdf, n=10, num_iters=num_iters)
         bars = ax.barh(top["Feature"][::-1], top["Sov_Score"][::-1],
                        color=["#e63946" if b else "#457b9d"
                                for b in top["Is_Locked"][::-1]])
         ax.set_title(f"{brain} — Top 10 Sovereign Score", fontweight="bold")
-        ax.set_xlabel("Sovereign Score (Persistence × Avg I_Norm)")
+        ax.set_xlabel("Sovereign Score (70% Impact · 15% Persist · 15% UV%)")
         ax.tick_params(axis="y", labelsize=7)
         # legend patches
         from matplotlib.patches import Patch
@@ -671,12 +896,15 @@ def main():
     print(f"  Features : {df['Feature'].nunique():,} unique")
     print(DIVIDER)
 
+    # ── vitality gate ─────────────────────────────────────────────────────────
+    report_vitality_gate(df, num_iters)
+
     # ── per-brain detail ──────────────────────────────────────────────────────
     for brain in brains:
         bdf = df[df["Brain"] == brain]
         report_brain(brain, bdf, num_iters)
 
-    # ── global sovereign summary ──────────────────────────────────────────────
+    # ── final sovereign scoring table (70/15/15) ──────────────────────────────
     report_sovereign_summary(df, num_iters)
 
     # ── input group analysis ──────────────────────────────────────────────────
