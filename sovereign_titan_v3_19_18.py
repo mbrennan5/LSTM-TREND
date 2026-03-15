@@ -396,13 +396,13 @@ def generate_factory_features_v2(df):
         'hma_21_pct':       pd.Series(hma_21_pct,       index=idx),
         'kalman_pct':       pd.Series(kalman_pct,       index=idx),
         # Price-unit oscillators — z-lens normalises cross-stock scaling
-        'mtsi':             pd.Series(mtsi,             index=idx),
+        #'mtsi':             pd.Series(mtsi,             index=idx),
     }
 
     # ── Apply LENS 10 & 90: z, z_slope, z_sos ────────────────────────────────
     for name, ind in Z_LENS_INDICATORS.items():
         arr = ind.values.astype(np.float64)
-        for lens in [10, 90]:
+        for lens in [10,30,60, 90]:
             rm   = pd.Series(arr, index=idx).rolling(lens).mean().values
             rs   = pd.Series(arr, index=idx).rolling(lens).std().values
             z    = (arr - rm) / (rs + 1e-9)
@@ -414,7 +414,7 @@ def generate_factory_features_v2(df):
 
     # ── Rolling % group: COG (unbounded — rolling deviation) ─────────────────
     cog_arr = cog_20.astype(np.float64)
-    for win in [10, 30, 90]:
+    for win in [10, 30, 60]:
         rm = pd.Series(cog_arr, index=idx).rolling(win).mean().values
         df[f'WIN_{win}_cog_20_pct'] = cog_arr / (rm + 1e-9) - 1
 
