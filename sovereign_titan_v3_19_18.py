@@ -1,4 +1,4 @@
-# SOVEREIGN TITAN v3.19.18 — GPU + SPEED EDITION v2
+# SOVEREIGN TITAN v3.20 - Scottie Pippen Edition
 # Speed changes vs prior version:
 #   1. Parallel yfinance downloads       (ThreadPoolExecutor)
 #   2. Sequences built ONCE per iter     (was rebuilt 150× per feature)
@@ -268,10 +268,12 @@ def generate_factory_features_v2(df):
     idx = df.index
 
     # ── Moving averages ────────────────────────────────────────────────────────
-    ema30   = pd.Series(hlc, index=idx).ewm(span=30).mean().values
-    ema30_2 = pd.Series(ema30, index=idx).ewm(span=30).mean().values
-    ema30_3 = pd.Series(ema30_2, index=idx).ewm(span=30).mean().values
-    tema_30 = 3*ema30 - 3*ema30_2 + ema30_3
+    ema10   = pd.Series(hlc, index=idx).ewm(span=10).mean().values
+    ema10_2 = pd.Series(ema30, index=idx).ewm(span=10).mean().values
+    ema10_3 = pd.Series(ema30_2, index=idx).ewm(span=10).mean().values
+    tema_10 = 3*ema10 - 3*ema10_2 + ema10_3
+
+    sma_5  = pd.Series(hlc, index=idx).rolling(5).mean().values
     sma_20  = pd.Series(hlc, index=idx).rolling(20).mean().values
 
     # WMA via Numba — replaces two rolling().apply(lambda) calls
@@ -371,7 +373,8 @@ def generate_factory_features_v2(df):
     # ══════════════════════════════════════════════════════════════════════════
 
     # ── Pre-transform Price MAs: hlc3 / MA - 1 ────────────────────────────────
-    tema_30_pct = hlc / (tema_30 + 1e-9) - 1
+    tema_10_pct = hlc / (tema_10 + 1e-9) - 1
+    sma_5_pct  = hlc / (sma_5  + 1e-9) - 1
     sma_20_pct  = hlc / (sma_20  + 1e-9) - 1
     hma_21_pct  = hlc / (hma_21  + 1e-9) - 1
     kalman_pct  = hlc / (kalman  + 1e-9) - 1
@@ -391,7 +394,8 @@ def generate_factory_features_v2(df):
         'dispersion_30':    pd.Series(dispersion_30,    index=idx),
         'lr_slope_30':      pd.Series(linreg_30,        index=idx),
         # Price MAs — pre-transformed to hlc3/MA - 1
-        'tema_30_pct':      pd.Series(tema_30_pct,      index=idx),
+        'tema_10_pct':      pd.Series(tema_10_pct,      index=idx),
+        'sma_5_pct':       pd.Series(sma_5_ct,       index=idx),
         'sma_20_pct':       pd.Series(sma_20_pct,       index=idx),
         'hma_21_pct':       pd.Series(hma_21_pct,       index=idx),
         'kalman_pct':       pd.Series(kalman_pct,       index=idx),
