@@ -316,6 +316,26 @@ def generate_factory_features_v2(df):
     sma_20_pct  = hlc / (sma_20  + 1e-9) - 1
     hma_21_pct  = hlc / (hma_21  + 1e-9) - 1
     kalman_pct  = hlc / (kalman  + 1e-9) - 1
+    # ── VHF (Vertical Horizontal Filter — needed for vhf_adx_ratio) ───────────
+    lo_s        = pd.Series(lo, index=idx)
+    cl_diff_abs = pd.Series(np.abs(np.diff(cl, prepend=cl[0])), index=idx)
+    vhf_28      = ((hi_s.rolling(28).max() - lo_s.rolling(28).min()) /
+                   (cl_diff_abs.rolling(28).sum() + 1e-9)).values
+    # ── Ratio features ────────────────────────────────────────────────────────
+    kalman_sma_ratio   = kalman  / (sma_20  + 1e-9) - 1
+    tema_kalman_ratio  = tema_30 / (kalman  + 1e-9) - 1
+    exhaustion         = (hlc - kalman) / (atr_14   + 1e-9)
+    ratio_acc          = _rolling_linslope(er_20,  10)
+    ratio_snr          = r_sq_30 / (1.0 - r_sq_30 + 1e-9)
+    curvature_diff     = _rolling_linslope(ema10, 10) - _rolling_linslope(ema30, 10)
+    cycle_vs_trend     = np.abs(cog_20) / (r_sq_30 + 1e-9)
+    ratio_eff_slope    = er_20 * np.sign(linreg_30)
+    ratio_pers_slope   = hurst_50 * np.sign(linreg_30)
+    ratio_struct       = (tema_10_pct - sma_20_pct) / (np.abs(sma_20_pct) + 1e-9)
+    adx_entropy_ratio  = adx_14  / (shannon_20 + 1e-9)
+    ratio_breakout_eff = np.abs(donchian_high_50) / (er_20 + 1e-9)
+    r_sq_hurst_ratio   = r_sq_30  / (hurst_50   + 1e-9)
+    vhf_adx_ratio      = vhf_28   / (adx_14     + 1e-9)
     # ── Z-lens group ──────────────────────────────────────────────────────────
     Z_LENS_INDICATORS = {
         'er_20':            pd.Series(er_20,            index=idx),
@@ -333,7 +353,21 @@ def generate_factory_features_v2(df):
         'sma_5_pct':        pd.Series(sma_5_pct,        index=idx),
         'sma_20_pct':       pd.Series(sma_20_pct,       index=idx),
         'hma_21_pct':       pd.Series(hma_21_pct,       index=idx),
-        'kalman_pct':       pd.Series(kalman_pct,       index=idx),
+        'kalman_pct':          pd.Series(kalman_pct,          index=idx),
+        'kalman_sma_ratio':    pd.Series(kalman_sma_ratio,    index=idx),
+        'tema_kalman_ratio':   pd.Series(tema_kalman_ratio,   index=idx),
+        'exhaustion':          pd.Series(exhaustion,          index=idx),
+        'ratio_acc':           pd.Series(ratio_acc,           index=idx),
+        'ratio_snr':           pd.Series(ratio_snr,           index=idx),
+        'curvature_diff':      pd.Series(curvature_diff,      index=idx),
+        'cycle_vs_trend':      pd.Series(cycle_vs_trend,      index=idx),
+        'ratio_eff_slope':     pd.Series(ratio_eff_slope,     index=idx),
+        'ratio_pers_slope':    pd.Series(ratio_pers_slope,    index=idx),
+        'ratio_struct':        pd.Series(ratio_struct,        index=idx),
+        'adx_entropy_ratio':   pd.Series(adx_entropy_ratio,   index=idx),
+        'ratio_breakout_eff':  pd.Series(ratio_breakout_eff,  index=idx),
+        'r_sq_hurst_ratio':    pd.Series(r_sq_hurst_ratio,    index=idx),
+        'vhf_adx_ratio':       pd.Series(vhf_adx_ratio,       index=idx),
     }
     # ── Apply LENS 10, 30, 60, 90: z, z_slope, z_sos ─────────────────────────
     for name, ind in Z_LENS_INDICATORS.items():
