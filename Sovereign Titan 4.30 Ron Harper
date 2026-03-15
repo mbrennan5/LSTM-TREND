@@ -511,6 +511,10 @@ def _eval_accuracy(model, X_batch, y_batch):
     correct = tf.equal(tf.cast(preds >= 0.5, tf.int32),
                        tf.cast(y_batch, tf.int32))
     return tf.reduce_mean(tf.cast(correct, tf.float32))
+# Number of features scored per forward pass during permutation importance.
+# Each slot adds (n_val × seq_len × n_features × 4B) to peak RAM.
+# 16 slots ≈ 123 MB at 75 symbols — safe on Colab free (12 GB).
+_PERM_BATCH = 16
 def run_judicial_audit(brain_name, master_df, model_type='GRU',
                        seq_len=10, epochs=25, batch_size=1024):
     feature_cols = [c for c in master_df.columns
@@ -521,13 +525,16 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
         master_df[feature_cols].values
     ).astype(np.float32)
     y_raw    = master_df['T_FINAL'].values.astype(np.float32)
-    n      = len(X_scaled)
-    X_seqs = np.stack([X_scaled[i - seq_len:i] for i in range(seq_len, n)])
+    # ── Sequence building: zero-copy strided view (replaces Python list comp) ──
+    X_seqs = (np.lib.stride_tricks
+                .sliding_window_view(X_scaled, (seq_len, n_features))
+                .reshape(-1, seq_len, n_features)[:-1].copy())
     y_seqs = y_raw[seq_len:]
     split       = int(len(X_seqs) * 0.8)
     X_tr, X_val = X_seqs[:split], X_seqs[split:]
     y_tr, y_val = y_seqs[:split], y_seqs[split:]
-    print(f"  [DATA] train={len(X_tr):,}  val={len(X_val):,}  features={n_features}")
+    n_val = len(X_val)
+    print(f"  [DATA] train={len(X_tr):,}  val={n_val:,}  features={n_features}")
     AUTO     = tf.data.AUTOTUNE
     train_ds = (tf.data.Dataset.from_tensor_slices((X_tr, y_tr))
                 .shuffle(min(20_000, len(X_tr)), reshuffle_each_iteration=True)
@@ -550,21 +557,32 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
     y_val_tf     = tf.constant(y_val)
     baseline_acc = _eval_accuracy(model, X_val_tf, y_val_tf).numpy()
     print(f"  [MODEL] Baseline val accuracy: {baseline_acc:.4f}")
-    report_rows = []
-    for fi, feat_name in enumerate(tqdm(feature_cols, desc="Permutation scoring")):
-        try:
-            saved           = X_val[:, :, fi].copy()          # save one column (~KB)
-            flat            = saved.flatten()
+    # ── Batched permutation importance ────────────────────────────────────────
+    # Groups _PERM_BATCH features per forward pass instead of one at a time.
+    # ~10 forward passes replace 150, cutting dispatch overhead ~15×.
+    y_val_int  = y_val.astype(np.int32)
+    i_raw_map  = {}
+    n_batches  = (n_features + _PERM_BATCH - 1) // _PERM_BATCH
+    for b in tqdm(range(n_batches), desc="Permutation scoring"):
+        batch_fis   = list(range(b * _PERM_BATCH,
+                                 min((b + 1) * _PERM_BATCH, n_features)))
+        n_b         = len(batch_fis)
+        # Stack n_b permuted copies of X_val: (n_b, n_val, seq_len, n_features)
+        X_batch     = np.tile(X_val[np.newaxis], (n_b, 1, 1, 1))
+        for j, fi in enumerate(batch_fis):
+            flat                    = X_batch[j, :, :, fi].flatten()
             np.random.shuffle(flat)
-            X_val[:, :, fi] = flat.reshape(saved.shape)       # shuffle in-place
-            perm_acc = _eval_accuracy(model, tf.constant(X_val), y_val_tf).numpy()
-            X_val[:, :, fi] = saved                           # restore
-            report_rows.append({
-                'Feature': feat_name,
-                'I_raw':   max(0.0, baseline_acc - perm_acc),
-            })
-        except Exception:
-            report_rows.append({'Feature': feat_name, 'I_raw': 0.0})
+            X_batch[j, :, :, fi]   = flat.reshape(n_val, seq_len)
+        # Single forward pass for all n_b permutations
+        preds = (model(tf.constant(X_batch.reshape(-1, seq_len, n_features)),
+                       training=False)
+                 .numpy()
+                 .reshape(n_b, n_val))
+        for j, fi in enumerate(batch_fis):
+            perm_acc = ((preds[j] >= 0.5).astype(np.int32) == y_val_int).mean()
+            i_raw_map[feature_cols[fi]] = max(0.0, baseline_acc - float(perm_acc))
+    report_rows = [{'Feature': f, 'I_raw': i_raw_map.get(f, 0.0)}
+                   for f in feature_cols]
     del model; gc.collect(); tf.keras.backend.clear_session()
     return pd.DataFrame(report_rows)
 # ==============================================================================
