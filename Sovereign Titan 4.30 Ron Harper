@@ -34,6 +34,11 @@ def setup_gpu():
     return True
 GPU_AVAILABLE = setup_gpu()
 DEVICE = '/device:GPU:0' if GPU_AVAILABLE else '/cpu:0'
+if not GPU_AVAILABLE:
+    _cpu_cores = max(1, (os.cpu_count() or 2))
+    tf.config.threading.set_intra_op_parallelism_threads(_cpu_cores)
+    tf.config.threading.set_inter_op_parallelism_threads(2)
+    print(f"[SYSTEM] CPU threading: intra={_cpu_cores}  inter=2")
 print(f"[SYSTEM] Active compute device: {DEVICE}\n")
 # ==============================================================================
 # ### BLOCK 1: SYSTEM INITIALIZATION
@@ -206,6 +211,18 @@ def _rolling_wma(arr, window):
             s += arr[i - window + 1 + j] * (j + 1)
         out[i] = s / w_sum
     return out
+# ── Aroon Up (replaces rolling().apply(lambda x: np.argmax(x)/25)) ────────────
+@jit(nopython=True, cache=True)
+def _rolling_aroon_up(arr, window):
+    """Position of highest high within window, normalised to [0, 1]."""
+    n = len(arr); out = np.full(n, np.nan)
+    for i in range(window - 1, n):
+        best = 0
+        for j in range(1, window):
+            if arr[i - window + 1 + j] > arr[i - window + 1 + best]:
+                best = j
+        out[i] = float(best) / (window - 1)
+    return out
 # ── Kalman filter ──────────────────────────────────────────────────────────────
 @jit(nopython=True, cache=True)
 def _kalman_numba(price, r=0.0001, q=0.001):
@@ -226,6 +243,7 @@ def _warm_up_numba():
     _rolling_shannon(dummy, 20)
     _rolling_r_sq(dummy, 30)
     _rolling_wma(dummy, 10)
+    _rolling_aroon_up(dummy, 25)
     _kalman_numba(dummy)
     print("✅ Numba kernels compiled and ready")
 _warm_up_numba()
@@ -311,9 +329,7 @@ def generate_factory_features_v2(df):
     hi_s             = pd.Series(hi, index=idx)
     donchian_high_20 = (hi_s / hi_s.rolling(20).max() - 1).values
     donchian_high_50 = (hi_s / hi_s.rolling(50).max() - 1).values
-    aroon_up_25      = hi_s.rolling(25).apply(
-        lambda x: float(np.argmax(x)) / 25, raw=True
-    ).values
+    aroon_up_25      = _rolling_aroon_up(hi, 25)
     # ── Pre-transform Price MAs: hlc3 / MA - 1 ────────────────────────────────
     tema_10_pct = hlc / (tema_10 + 1e-9) - 1
     tema_30_pct = hlc / (tema_30 + 1e-9) - 1
@@ -533,7 +549,7 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
                 ReduceLROnPlateau(monitor='val_loss', factor=0.5,
                                   patience=3, min_lr=1e-5),
             ],
-            verbose=1,
+            verbose=0,
         )
     X_val_tf     = tf.constant(X_val)
     y_val_tf     = tf.constant(y_val)
@@ -542,11 +558,12 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
     report_rows = []
     for fi, feat_name in enumerate(tqdm(feature_cols, desc="Permutation scoring")):
         try:
-            X_perm = X_val.copy()
-            flat   = X_perm[:, :, fi].flatten()
+            saved           = X_val[:, :, fi].copy()          # save one column (~KB)
+            flat            = saved.flatten()
             np.random.shuffle(flat)
-            X_perm[:, :, fi] = flat.reshape(X_perm[:, :, fi].shape)
-            perm_acc = _eval_accuracy(model, tf.constant(X_perm), y_val_tf).numpy()
+            X_val[:, :, fi] = flat.reshape(saved.shape)       # shuffle in-place
+            perm_acc = _eval_accuracy(model, tf.constant(X_val), y_val_tf).numpy()
+            X_val[:, :, fi] = saved                           # restore
             report_rows.append({
                 'Feature': feat_name,
                 'I_raw':   max(0.0, baseline_acc - perm_acc),
