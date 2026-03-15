@@ -355,6 +355,15 @@ def generate_factory_features_v2(df):
     donchian_high_20 = (hi_s / hi_s.rolling(20).max() - 1).values
     _eps = 1e-9
 
+    def _dominant_cycle_func(y):
+        n = len(y)
+        if n < 10: return 20.0
+        diffs = np.diff(y)
+        sign_changes = np.sum(np.abs(np.diff(np.sign(diffs))) > 0)
+        period = 2.0 * n / (sign_changes + 1e-9)
+        return max(5.0, min(period, 60.0))
+    dominant_cycle_20 = pd.Series(hlc, index=idx).rolling(20).apply(_dominant_cycle_func, raw=True).values
+
     # ── Log-Ratio Protocol (Sovereign Titan v4.0 mandate) ─────────────────────
     # Category 1 — Price Anchors: log(A) − log(B)  [stationarity mandate]
     kalman_sma_ratio  = np.log(np.abs(kalman)  + _eps) - np.log(np.abs(sma_20)  + _eps)
@@ -377,6 +386,10 @@ def generate_factory_features_v2(df):
     ratio_struct       = np.log(np.abs(r_sq_20)          + _eps) - np.log(shannon_20 + _eps)
     adx_entropy_ratio  = np.log(np.abs(adx_14)           + _eps) - np.log(shannon_20 + _eps)
     ratio_breakout_eff = np.log(np.abs(donchian_high_20) + _eps) - np.log(er_20      + _eps)
+
+    # cycle_vs_trend: cycle period (positive) ÷ slope (signed) → velocity seed transform
+    _cycle_vs_trend_raw = dominant_cycle_20 / (linreg_30 + _eps)
+    cycle_vs_trend      = np.sign(_cycle_vs_trend_raw) * np.log(np.abs(_cycle_vs_trend_raw) + _eps)
 
     # ══════════════════════════════════════════════════════════════════════════
     # INDICATOR CLASSIFICATION
@@ -402,7 +415,7 @@ def generate_factory_features_v2(df):
     #   cog_20: Center of Gravity is in price units, unbounded.
     #           cog / rolling_mean(cog, N) - 1 measures deviation from norm.
     #
-    # TOTAL: (16 + 11) × 2 × 3 + 3 = 162 + 3 = 165 features
+    # TOTAL: (16 + 12) × 2 × 3 + 3 = 168 + 3 = 171 features
     # ══════════════════════════════════════════════════════════════════════════
 
     # ── Pre-transform Price MAs: hlc3 / MA - 1 ────────────────────────────────
@@ -447,6 +460,7 @@ def generate_factory_features_v2(df):
         'ratio_struct':       pd.Series(ratio_struct,       index=idx),
         'adx_entropy_ratio':  pd.Series(adx_entropy_ratio,  index=idx),
         'ratio_breakout_eff': pd.Series(ratio_breakout_eff, index=idx),
+        'cycle_vs_trend':     pd.Series(cycle_vs_trend,     index=idx),
     }
 
     # ── Apply LENS 10 & 90: z, z_slope, z_sos ────────────────────────────────
