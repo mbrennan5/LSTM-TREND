@@ -576,7 +576,7 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
             c for c in master_df.columns
             if c not in _EASE_SKIP_COLS
             and c != 'T_FINAL'
-            and master_df[c].dtype in (np.float32, np.float64, np.int32, np.int64)
+            and pd.api.types.is_numeric_dtype(master_df[c])
         ]
     else:
         feature_cols = [c for c in master_df.columns
