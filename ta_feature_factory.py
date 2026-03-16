@@ -851,19 +851,30 @@ def run_lookback_tester():
         n, desc, fam = _CAT_BY_KEY[key]
         print(f"    {n:>2}. [{fam:<10}] {desc}")
 
-    # ── BO search space ────────────────────────────────────────────────────────
+    # ── Lookback lists ─────────────────────────────────────────────────────────
     print()
-    ind_min = int(input("indicator_n  MIN  (e.g. 5):   ") or "5")
-    ind_max = int(input("indicator_n  MAX  (e.g. 60):  ") or "60")
-    z_min   = int(input("z_n          MIN  (e.g. 5):   ") or "5")
-    z_max   = int(input("z_n          MAX  (e.g. 60):  ") or "60")
-    n_bo    = int(input("BO calls (20-50 recommended): ") or "25")
+    raw_ind = input("indicator_n values to test (e.g. 5,10,20,30,40,60): ").strip()
+    raw_z   = input("z_n values to test         (e.g. 5,10,20,30,40,60): ").strip()
+
+    def _parse_csv_ints(s: str) -> list[int]:
+        out = []
+        for tok in s.split(','):
+            tok = tok.strip()
+            if tok.isdigit():
+                out.append(int(tok))
+        return sorted(set(out))
+
+    ind_list = _parse_csv_ints(raw_ind)
+    z_list   = _parse_csv_ints(raw_z)
+
+    if not ind_list or not z_list:
+        print("⚠️  No valid values parsed. Exiting."); return pd.DataFrame()
 
     # ── Other inputs ───────────────────────────────────────────────────────────
     brain_ch    = input("Brain (1:DIR / 2:EXP) [default 1]: ").strip() or "1"
     brain_name  = {'1': 'DIRECTION', '2': 'EXP'}.get(brain_ch, 'DIRECTION')
     model_type  = 'GRU' if brain_name == 'DIRECTION' else 'LSTM'
-    num_symbols = int(input("Symbols per BO call (e.g. 30): ") or "30")
+    num_symbols = int(input("Symbols per eval (e.g. 30): ") or "30")
 
     # ── Random 3-year window within the last 15 years ─────────────────────────
     cy   = 2026
@@ -872,68 +883,43 @@ def run_lookback_tester():
     start_date = datetime.date(sy, sm, 1)
     end_date   = start_date + datetime.timedelta(days=3 * 365)
 
-    n_init = max(3, n_bo // 5)   # random points before GP kicks in
-    n_acq  = n_bo - n_init        # GP-guided evaluations
+    import itertools
+    grid = list(itertools.product(ind_list, z_list))
 
     print(f"\n{'─'*68}")
     print(f"  Test window    : {start_date} → {end_date}  (3 years)")
     print(f"  Brain          : {brain_name}  ({model_type})")
-    print(f"  BO space       : ind_n ∈ [{ind_min},{ind_max}]  ×  z_n ∈ [{z_min},{z_max}]")
-    print(f"  BO calls       : {n_bo}  ({n_init} random  +  {n_acq} GP-guided)")
+    print(f"  indicator_n    : {ind_list}")
+    print(f"  z_n            : {z_list}")
+    print(f"  Combinations   : {len(grid)}  ({len(ind_list)} × {len(z_list)})")
     print(f"  Features       : {len(selected)}  →  {len(selected)*3} LENS columns per pair")
     print(f"{'─'*68}\n")
 
-    # ── Sample symbols once (same pool for all BO calls) ─────────────────────
+    # ── Sample symbols once (same pool for all evals) ─────────────────────────
     symbols = random.sample(TITAN_SYMBOLS, min(num_symbols, len(TITAN_SYMBOLS)))
 
-    # ── Bayesian Optimisation ──────────────────────────────────────────────────
-    if HAS_SKOPT:
-        space = [SkInt(ind_min, ind_max, name='indicator_n'),
-                 SkInt(z_min,   z_max,   name='z_n')]
-        obj   = functools.partial(
-            _bo_objective,
-            symbols=symbols, start_date=start_date, end_date=end_date,
-            selected_features=selected, brain_name=brain_name,
-            model_type=model_type,
+    # ── Exhaustive grid over specified lookback combinations ──────────────────
+    best_acc, best_ind_n, best_z_n = -1.0, ind_list[0], z_list[0]
+    results: list[tuple] = []
+    for i, (ind_n, z_n) in enumerate(grid, 1):
+        print(f"\n[{i}/{len(grid)}] Testing ind_n={ind_n}  z_n={z_n} …")
+        acc = 1.0 - _bo_objective(
+            [ind_n, z_n],
+            symbols, start_date, end_date,
+            selected, brain_name, model_type,
         )
-        print("🔬 Starting Bayesian Optimisation …")
-        bo_result = gp_minimize(obj, space,
-                                n_calls=n_bo,
-                                n_initial_points=n_init,
-                                random_state=42,
-                                verbose=False)
-        best_ind_n, best_z_n = int(bo_result.x[0]), int(bo_result.x[1])
-        best_acc = 1.0 - float(bo_result.fun)
+        results.append((ind_n, z_n, acc))
+        if acc > best_acc:
+            best_acc, best_ind_n, best_z_n = acc, ind_n, z_n
 
-        # ── Convergence summary ────────────────────────────────────────────────
-        print(f"\n{'═'*68}")
-        print("  BAYESIAN OPTIMISATION — CALL HISTORY")
-        print(f"  {'Call':>4}  {'ind_n':>6}  {'z_n':>5}  {'acc':>8}")
-        print(f"  {'─'*40}")
-        for i, (xi, yi) in enumerate(zip(bo_result.x_iters, bo_result.func_vals)):
-            marker = " ← best" if xi == bo_result.x else ""
-            print(f"  {i+1:>4}  {int(xi[0]):>6}  {int(xi[1]):>5}  "
-                  f"{1-yi:>8.4f}{marker}")
-
-    else:
-        # ── Grid search fallback ───────────────────────────────────────────────
-        print("⚙  BO unavailable — running grid search …")
-        import itertools
-        step_i = max(1, (ind_max - ind_min) // 5)
-        step_z = max(1, (z_max  - z_min)   // 5)
-        grid   = list(itertools.product(
-            range(ind_min, ind_max + 1, step_i),
-            range(z_min,   z_max  + 1, step_z),
-        ))
-        best_acc, best_ind_n, best_z_n = -1.0, ind_min, z_min
-        for ind_n, z_n in grid:
-            acc = 1.0 - _bo_objective(
-                [ind_n, z_n],
-                symbols, start_date, end_date,
-                selected, brain_name, model_type,
-            )
-            if acc > best_acc:
-                best_acc, best_ind_n, best_z_n = acc, ind_n, z_n
+    # ── Results table ──────────────────────────────────────────────────────────
+    print(f"\n{'═'*68}")
+    print("  GRID SEARCH — FULL RESULTS")
+    print(f"  {'#':>3}  {'ind_n':>6}  {'z_n':>5}  {'acc':>8}")
+    print(f"  {'─'*35}")
+    for i, (ind_n, z_n, acc) in enumerate(results, 1):
+        marker = " ← best" if (ind_n == best_ind_n and z_n == best_z_n) else ""
+        print(f"  {i:>3}  {ind_n:>6}  {z_n:>5}  {acc:>8.4f}{marker}")
 
     # ── Final audit at optimal pair ────────────────────────────────────────────
     print(f"\n{'═'*68}")
