@@ -54,6 +54,9 @@ from datetime import datetime
 from google.colab import drive
 if not os.path.exists('/content/drive'):
     drive.mount('/content/drive', force_remount=True)
+EASE_DB_PATH    = '/content/drive/MyDrive/backtest_results/FRICTION_MASTER_DB.parquet'
+_EASE_DB        = None   # lazy-loaded on first EASE iteration
+_EASE_SKIP_COLS = frozenset({'symbol', 'EASE_val', 'EXP_val', 'DIR_val', 'T_FINAL'})
 TEST_NAME        = "Sovereign_Titan_v3.19.18_Entropy_Injection"
 OUTPUT_DRIVE_DIR = f'/content/drive/MyDrive/judicial_results/{TEST_NAME}/'
 if not os.path.exists(OUTPUT_DRIVE_DIR):
@@ -487,9 +490,48 @@ def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
     print(f"   ✅ {len(all_data)} symbols processed")
     return pd.concat(all_data, axis=0)
 # ==============================================================================
+# ### BLOCK 4B: EASE PARQUET LOADER
+# For EASE brain only: reads parquet columns as features and sets
+# T_FINAL = T_EASE_REL (normalised next-period EASE_val) — no yfinance needed.
+# ==============================================================================
+def load_ease_from_parquet(symbol_list):
+    global _EASE_DB
+    if _EASE_DB is None:
+        print(f"📂 Loading EASE parquet: {EASE_DB_PATH}")
+        _EASE_DB = pd.read_parquet(EASE_DB_PATH)
+        _EASE_DB.index = pd.to_datetime(_EASE_DB.index)
+        print(f"   ✅ {len(_EASE_DB):,} rows | {_EASE_DB['symbol'].nunique()} symbols")
+    all_data = []
+    sym_col  = 'symbol' in _EASE_DB.columns
+    for sym in tqdm(symbol_list, desc="⚙ EASE (parquet)"):
+        try:
+            s_df = (_EASE_DB[_EASE_DB['symbol'] == sym].copy() if sym_col
+                    else _EASE_DB.xs(sym, level='symbol').copy())
+            if len(s_df) < 120 or 'EASE_val' not in s_df.columns:
+                continue
+            # T_EASE_REL: normalised next-period EASE_val (mirrors reference notebook)
+            s_df['T_FINAL'] = (
+                (s_df['EASE_val'].shift(-1) - s_df['EASE_val'].rolling(20).mean())
+                / (s_df['EASE_val'].rolling(20).std() + 1e-9)
+            )
+            s_df = s_df.dropna(subset=['T_FINAL'])
+            if s_df.empty:
+                continue
+            s_df['symbol'] = sym
+            all_data.append(s_df)
+        except Exception:
+            continue
+    if not all_data:
+        print("❌ No EASE data built from parquet.")
+        return pd.DataFrame()
+    result = pd.concat(all_data, axis=0)
+    print(f"   ✅ {len(all_data)} EASE symbols | {len(result):,} rows")
+    return result
+# ==============================================================================
 # ### BLOCK 5: GPU-ACCELERATED AUDIT
 # ==============================================================================
-def build_full_model(model_type, n_features, seq_len, device=DEVICE):
+def build_full_model(model_type, n_features, seq_len, device=DEVICE,
+                     regression=False):
     with tf.device(device):
         model = Sequential([
             Input(shape=(seq_len, n_features)),
@@ -499,11 +541,16 @@ def build_full_model(model_type, n_features, seq_len, device=DEVICE):
             GRU(64) if model_type == 'GRU' else LSTM(64),
             Dropout(0.2),
             Dense(32, activation='relu'),
-            Dense(1,  activation='sigmoid', dtype='float32'),
+            Dense(1,  activation='linear' if regression else 'sigmoid',
+                  dtype='float32'),
         ])
-        model.compile(optimizer=Adam(1e-3),
-                      loss='binary_crossentropy',
-                      metrics=['accuracy'])
+        if regression:
+            model.compile(optimizer=Adam(1e-3),
+                          loss=tf.keras.losses.Huber())
+        else:
+            model.compile(optimizer=Adam(1e-3),
+                          loss='binary_crossentropy',
+                          metrics=['accuracy'])
     return model
 @tf.function
 def _eval_accuracy(model, X_batch, y_batch):
@@ -511,21 +558,36 @@ def _eval_accuracy(model, X_batch, y_batch):
     correct = tf.equal(tf.cast(preds >= 0.5, tf.int32),
                        tf.cast(y_batch, tf.int32))
     return tf.reduce_mean(tf.cast(correct, tf.float32))
+@tf.function
+def _eval_mae(model, X_batch, y_batch):
+    preds = tf.squeeze(model(X_batch, training=False), axis=-1)
+    return tf.reduce_mean(tf.abs(preds - y_batch))
 # Number of features scored per forward pass during permutation importance.
 # Each slot adds (n_val × seq_len × n_features × 4B) to peak RAM.
 # 16 slots ≈ 123 MB at 75 symbols — safe on Colab free (12 GB).
 _PERM_BATCH = 16
 def run_judicial_audit(brain_name, master_df, model_type='GRU',
                        seq_len=10, epochs=25, batch_size=1024):
-    feature_cols = [c for c in master_df.columns
-                    if c.startswith('LENS_') or c.startswith('WIN_')]
-    n_features   = len(feature_cols)
+    regression = (brain_name == 'EASE')
+    # ── Feature column selection ───────────────────────────────────────────────
+    if regression:
+        # Parquet columns: use all numeric, skip metadata / target-adjacent cols
+        feature_cols = [
+            c for c in master_df.columns
+            if c not in _EASE_SKIP_COLS
+            and c != 'T_FINAL'
+            and master_df[c].dtype in (np.float32, np.float64, np.int32, np.int64)
+        ]
+    else:
+        feature_cols = [c for c in master_df.columns
+                        if c.startswith('LENS_') or c.startswith('WIN_')]
+    n_features = len(feature_cols)
     scaler   = RobustScaler()
     X_scaled = scaler.fit_transform(
         master_df[feature_cols].values
     ).astype(np.float32)
-    y_raw    = master_df['T_FINAL'].values.astype(np.float32)
-    # ── Sequence building: zero-copy strided view (replaces Python list comp) ──
+    y_raw = master_df['T_FINAL'].values.astype(np.float32)
+    # ── Sequence building: zero-copy strided view ──────────────────────────────
     X_seqs = (np.lib.stride_tricks
                 .sliding_window_view(X_scaled, (seq_len, n_features))
                 .reshape(-1, seq_len, n_features)[:-1].copy())
@@ -541,7 +603,7 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
                 .batch(batch_size).prefetch(AUTO))
     val_ds   = (tf.data.Dataset.from_tensor_slices((X_val, y_val))
                 .batch(batch_size * 2).prefetch(AUTO))
-    model = build_full_model(model_type, n_features, seq_len)
+    model = build_full_model(model_type, n_features, seq_len, regression=regression)
     with tf.device(DEVICE):
         model.fit(
             train_ds, validation_data=val_ds, epochs=epochs,
@@ -553,34 +615,39 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
             ],
             verbose=0,
         )
-    X_val_tf     = tf.constant(X_val)
-    y_val_tf     = tf.constant(y_val)
-    baseline_acc = _eval_accuracy(model, X_val_tf, y_val_tf).numpy()
-    print(f"  [MODEL] Baseline val accuracy: {baseline_acc:.4f}")
+    X_val_tf = tf.constant(X_val)
+    y_val_tf = tf.constant(y_val)
+    if regression:
+        baseline_metric = _eval_mae(model, X_val_tf, y_val_tf).numpy()
+        print(f"  [MODEL] Baseline val MAE: {baseline_metric:.4f}")
+    else:
+        baseline_metric = _eval_accuracy(model, X_val_tf, y_val_tf).numpy()
+        print(f"  [MODEL] Baseline val accuracy: {baseline_metric:.4f}")
     # ── Batched permutation importance ────────────────────────────────────────
-    # Groups _PERM_BATCH features per forward pass instead of one at a time.
-    # ~10 forward passes replace 150, cutting dispatch overhead ~15×.
-    y_val_int  = y_val.astype(np.int32)
-    i_raw_map  = {}
-    n_batches  = (n_features + _PERM_BATCH - 1) // _PERM_BATCH
+    y_val_int = y_val.astype(np.int32)   # only used in classification path
+    i_raw_map = {}
+    n_batches = (n_features + _PERM_BATCH - 1) // _PERM_BATCH
     for b in tqdm(range(n_batches), desc="Permutation scoring"):
-        batch_fis   = list(range(b * _PERM_BATCH,
-                                 min((b + 1) * _PERM_BATCH, n_features)))
-        n_b         = len(batch_fis)
-        # Stack n_b permuted copies of X_val: (n_b, n_val, seq_len, n_features)
-        X_batch     = np.tile(X_val[np.newaxis], (n_b, 1, 1, 1))
+        batch_fis = list(range(b * _PERM_BATCH,
+                               min((b + 1) * _PERM_BATCH, n_features)))
+        n_b       = len(batch_fis)
+        X_batch   = np.tile(X_val[np.newaxis], (n_b, 1, 1, 1))
         for j, fi in enumerate(batch_fis):
-            flat                    = X_batch[j, :, :, fi].flatten()
+            flat                  = X_batch[j, :, :, fi].flatten()
             np.random.shuffle(flat)
-            X_batch[j, :, :, fi]   = flat.reshape(n_val, seq_len)
-        # Single forward pass for all n_b permutations
+            X_batch[j, :, :, fi] = flat.reshape(n_val, seq_len)
         preds = (model(tf.constant(X_batch.reshape(-1, seq_len, n_features)),
                        training=False)
                  .numpy()
                  .reshape(n_b, n_val))
         for j, fi in enumerate(batch_fis):
-            perm_acc = ((preds[j] >= 0.5).astype(np.int32) == y_val_int).mean()
-            i_raw_map[feature_cols[fi]] = max(0.0, baseline_acc - float(perm_acc))
+            if regression:
+                perm_metric = float(np.mean(np.abs(preds[j] - y_val)))
+                # higher MAE after permutation → feature was carrying signal
+                i_raw_map[feature_cols[fi]] = max(0.0, perm_metric - baseline_metric)
+            else:
+                perm_acc = ((preds[j] >= 0.5).astype(np.int32) == y_val_int).mean()
+                i_raw_map[feature_cols[fi]] = max(0.0, baseline_metric - float(perm_acc))
     report_rows = [{'Feature': f, 'I_raw': i_raw_map.get(f, 0.0)}
                    for f in feature_cols]
     del model; gc.collect(); tf.keras.backend.clear_session()
@@ -688,8 +755,16 @@ for BRAIN in BRAINS_TO_RUN:
         print(f"\n{'─'*55}")
         print(f"  Iteration {it}/{num_iters}  —  Brain: {BRAIN}")
         print(f"{'─'*55}")
-        POOL      = random.sample(TITAN_SYMBOLS, min(num_symbols, len(TITAN_SYMBOLS)))
-        master_df = load_hybrid_data_parallel(BRAIN, POOL)
+        if BRAIN == 'EASE':
+            # ── EASE: pull symbols + features entirely from the parquet ────────
+            if _EASE_DB is None:
+                load_ease_from_parquet([])   # warm cache; returns empty df
+            POOL      = list(_EASE_DB['symbol'].value_counts()
+                             .head(num_symbols).index)
+            master_df = load_ease_from_parquet(POOL)
+        else:
+            POOL      = random.sample(TITAN_SYMBOLS, min(num_symbols, len(TITAN_SYMBOLS)))
+            master_df = load_hybrid_data_parallel(BRAIN, POOL)
         if master_df.empty:
             print("  ⚠️  Empty master_df — skipping.")
             continue
