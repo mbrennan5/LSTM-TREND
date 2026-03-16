@@ -483,14 +483,21 @@ def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
 # EASE_val.shift(-1) as the regression target — no OHLCV download needed.
 # ==============================================================================
 _EASE_SKIP_COLS = {'symbol', 'EASE_val', 'EXP_val', 'DIR_val', 'T_FINAL'}
+EASE_DATE_MIN: pd.Timestamp | None = None   # set on first parquet load
+EASE_DATE_MAX: pd.Timestamp | None = None   # set on first parquet load
 def load_ease_from_parquet(symbol_list):
-    """Build EASE master_df from parquet; returns DataFrame with T_FINAL set."""
-    global _EASE_DB
+    """Build EASE master_df from parquet; returns DataFrame with T_FINAL set.
+    Test-range dates are derived from the parquet index (no hardcoded dates).
+    """
+    global _EASE_DB, EASE_DATE_MIN, EASE_DATE_MAX
     if _EASE_DB is None:
         print(f"📂 Loading EASE parquet: {EASE_DB_PATH}")
         _EASE_DB = pd.read_parquet(EASE_DB_PATH)
         _EASE_DB.index = pd.to_datetime(_EASE_DB.index)
+        EASE_DATE_MIN = _EASE_DB.index.min()
+        EASE_DATE_MAX = _EASE_DB.index.max()
         print(f"   ✅ {len(_EASE_DB):,} rows | {_EASE_DB['symbol'].nunique()} symbols")
+        print(f"   📅 EASE test range: {EASE_DATE_MIN.date()} → {EASE_DATE_MAX.date()}")
     all_data = []
     sym_col  = 'symbol' in _EASE_DB.columns
     for sym in tqdm(symbol_list, desc="⚙ EASE (parquet)"):
