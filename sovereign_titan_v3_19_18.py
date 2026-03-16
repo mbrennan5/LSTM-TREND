@@ -54,6 +54,8 @@ from datetime import datetime
 from google.colab import drive
 if not os.path.exists('/content/drive'):
     drive.mount('/content/drive', force_remount=True)
+EASE_DB_PATH = '/content/drive/MyDrive/backtest_results/FRICTION_MASTER_DB.parquet'
+_EASE_DB     = None   # lazy-loaded on first EASE iteration
 TEST_NAME        = "Sovereign_Titan_v3.19.18_Entropy_Injection"
 OUTPUT_DRIVE_DIR = f'/content/drive/MyDrive/judicial_results/{TEST_NAME}/'
 if not os.path.exists(OUTPUT_DRIVE_DIR):
@@ -476,9 +478,46 @@ def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
     print(f"   ✅ {len(all_data)} symbols processed")
     return pd.concat(all_data, axis=0)
 # ==============================================================================
+# ### BLOCK 4B: EASE PARQUET LOADER (replaces yfinance for EASE brain only)
+# Uses FRICTION_MASTER_DB parquet columns directly as features and
+# EASE_val.shift(-1) as the regression target — no OHLCV download needed.
+# ==============================================================================
+_EASE_SKIP_COLS = {'symbol', 'EASE_val', 'EXP_val', 'DIR_val', 'T_FINAL'}
+def load_ease_from_parquet(symbol_list):
+    """Build EASE master_df from parquet; returns DataFrame with T_FINAL set."""
+    global _EASE_DB
+    if _EASE_DB is None:
+        print(f"📂 Loading EASE parquet: {EASE_DB_PATH}")
+        _EASE_DB = pd.read_parquet(EASE_DB_PATH)
+        _EASE_DB.index = pd.to_datetime(_EASE_DB.index)
+        print(f"   ✅ {len(_EASE_DB):,} rows | {_EASE_DB['symbol'].nunique()} symbols")
+    all_data = []
+    sym_col  = 'symbol' in _EASE_DB.columns
+    for sym in tqdm(symbol_list, desc="⚙ EASE (parquet)"):
+        try:
+            s_df = (_EASE_DB[_EASE_DB['symbol'] == sym].copy() if sym_col
+                    else _EASE_DB.xs(sym, level='symbol').copy())
+            if len(s_df) < 120 or 'EASE_val' not in s_df.columns:
+                continue
+            s_df['T_FINAL'] = s_df['EASE_val'].shift(-1)
+            s_df = s_df.dropna(subset=['T_FINAL'])
+            if s_df.empty:
+                continue
+            s_df['symbol'] = sym
+            all_data.append(s_df)
+        except Exception:
+            continue
+    if not all_data:
+        print("❌ No EASE data built from parquet.")
+        return pd.DataFrame()
+    result = pd.concat(all_data, axis=0)
+    print(f"   ✅ {len(all_data)} EASE symbols built from parquet ({len(result):,} rows)")
+    return result
+# ==============================================================================
 # ### BLOCK 5: GPU-ACCELERATED AUDIT
 # ==============================================================================
-def build_full_model(model_type, n_features, seq_len, device=DEVICE):
+def build_full_model(model_type, n_features, seq_len, device=DEVICE,
+                     regression=False):
     with tf.device(device):
         model = Sequential([
             Input(shape=(seq_len, n_features)),
@@ -488,11 +527,16 @@ def build_full_model(model_type, n_features, seq_len, device=DEVICE):
             GRU(64) if model_type == 'GRU' else LSTM(64),
             Dropout(0.2),
             Dense(32, activation='relu'),
-            Dense(1,  activation='sigmoid', dtype='float32'),
+            Dense(1,  activation='linear' if regression else 'sigmoid',
+                  dtype='float32'),
         ])
-        model.compile(optimizer=Adam(1e-3),
-                      loss='binary_crossentropy',
-                      metrics=['accuracy'])
+        if regression:
+            model.compile(optimizer=Adam(1e-3),
+                          loss=tf.keras.losses.Huber())
+        else:
+            model.compile(optimizer=Adam(1e-3),
+                          loss='binary_crossentropy',
+                          metrics=['accuracy'])
     return model
 @tf.function
 def _eval_accuracy(model, X_batch, y_batch):
@@ -500,16 +544,36 @@ def _eval_accuracy(model, X_batch, y_batch):
     correct = tf.equal(tf.cast(preds >= 0.5, tf.int32),
                        tf.cast(y_batch, tf.int32))
     return tf.reduce_mean(tf.cast(correct, tf.float32))
+@tf.function
+def _eval_mae(model, X_batch, y_batch):
+    preds = tf.squeeze(model(X_batch, training=False), axis=-1)
+    return tf.reduce_mean(tf.abs(preds - y_batch))
 def run_judicial_audit(brain_name, master_df, model_type='GRU',
                        seq_len=10, epochs=5, batch_size=1024):
-    feature_cols = [c for c in master_df.columns
-                    if c.startswith('LENS_') or c.startswith('WIN_')]
-    n_features   = len(feature_cols)
+    regression = (brain_name == 'EASE')
+    # ── Feature column selection ───────────────────────────────────────────────
+    if regression:
+        # Use all numeric parquet columns; skip metadata / target-adjacent cols
+        feature_cols = [
+            c for c in master_df.columns
+            if c not in _EASE_SKIP_COLS
+            and master_df[c].dtype in (np.float32, np.float64, np.int32, np.int64)
+            and c != 'T_FINAL'
+        ]
+    else:
+        feature_cols = [c for c in master_df.columns
+                        if c.startswith('LENS_') or c.startswith('WIN_')]
+    n_features = len(feature_cols)
+    # ── X scaling ─────────────────────────────────────────────────────────────
     scaler   = RobustScaler()
     X_scaled = scaler.fit_transform(
         master_df[feature_cols].values
     ).astype(np.float32)
-    y_raw    = master_df['T_FINAL'].values.astype(np.float32)
+    # ── y: regression needs z-score normalisation ──────────────────────────────
+    y_raw = master_df['T_FINAL'].values.astype(np.float32)
+    if regression:
+        y_scaler = RobustScaler()
+        y_raw = y_scaler.fit_transform(y_raw.reshape(-1, 1)).flatten().astype(np.float32)
     n      = len(X_scaled)
     X_seqs = np.stack([X_scaled[i - seq_len:i] for i in range(seq_len, n)])
     y_seqs = y_raw[seq_len:]
@@ -523,7 +587,7 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
                 .batch(batch_size).prefetch(AUTO))
     val_ds   = (tf.data.Dataset.from_tensor_slices((X_val, y_val))
                 .batch(batch_size * 2).prefetch(AUTO))
-    model = build_full_model(model_type, n_features, seq_len)
+    model = build_full_model(model_type, n_features, seq_len, regression=regression)
     with tf.device(DEVICE):
         model.fit(
             train_ds, validation_data=val_ds, epochs=epochs,
@@ -535,10 +599,14 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
             ],
             verbose=1,
         )
-    X_val_tf     = tf.constant(X_val)
-    y_val_tf     = tf.constant(y_val)
-    baseline_acc = _eval_accuracy(model, X_val_tf, y_val_tf).numpy()
-    print(f"  [MODEL] Baseline val accuracy: {baseline_acc:.4f}")
+    X_val_tf = tf.constant(X_val)
+    y_val_tf = tf.constant(y_val)
+    if regression:
+        baseline_metric = _eval_mae(model, X_val_tf, y_val_tf).numpy()
+        print(f"  [MODEL] Baseline val MAE: {baseline_metric:.4f}")
+    else:
+        baseline_metric = _eval_accuracy(model, X_val_tf, y_val_tf).numpy()
+        print(f"  [MODEL] Baseline val accuracy: {baseline_metric:.4f}")
     report_rows = []
     for fi, feat_name in enumerate(tqdm(feature_cols, desc="Permutation scoring")):
         try:
@@ -546,11 +614,14 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
             flat   = X_perm[:, :, fi].flatten()
             np.random.shuffle(flat)
             X_perm[:, :, fi] = flat.reshape(X_perm[:, :, fi].shape)
-            perm_acc = _eval_accuracy(model, tf.constant(X_perm), y_val_tf).numpy()
-            report_rows.append({
-                'Feature': feat_name,
-                'I_raw':   max(0.0, baseline_acc - perm_acc),
-            })
+            if regression:
+                perm_metric = _eval_mae(model, tf.constant(X_perm), y_val_tf).numpy()
+                # higher MAE after permutation → feature was important
+                importance  = max(0.0, perm_metric - baseline_metric)
+            else:
+                perm_metric = _eval_accuracy(model, tf.constant(X_perm), y_val_tf).numpy()
+                importance  = max(0.0, baseline_metric - perm_metric)
+            report_rows.append({'Feature': feat_name, 'I_raw': importance})
         except Exception:
             report_rows.append({'Feature': feat_name, 'I_raw': 0.0})
     del model; gc.collect(); tf.keras.backend.clear_session()
@@ -658,8 +729,18 @@ for BRAIN in BRAINS_TO_RUN:
         print(f"\n{'─'*55}")
         print(f"  Iteration {it}/{num_iters}  —  Brain: {BRAIN}")
         print(f"{'─'*55}")
-        POOL      = random.sample(TITAN_SYMBOLS, min(num_symbols, len(TITAN_SYMBOLS)))
-        master_df = load_hybrid_data_parallel(BRAIN, POOL)
+        if BRAIN == 'EASE':
+            # ── EASE: symbols + data come entirely from the parquet ────────────
+            # load_ease_from_parquet initialises _EASE_DB on first call;
+            # call with full pool so the cache is warm for the symbol sample.
+            if _EASE_DB is None:
+                load_ease_from_parquet([])   # warm the cache (returns empty df)
+            POOL      = list(_EASE_DB['symbol'].value_counts()
+                             .head(num_symbols).index)
+            master_df = load_ease_from_parquet(POOL)
+        else:
+            POOL      = random.sample(TITAN_SYMBOLS, min(num_symbols, len(TITAN_SYMBOLS)))
+            master_df = load_hybrid_data_parallel(BRAIN, POOL)
         if master_df.empty:
             print("  ⚠️  Empty master_df — skipping.")
             continue
