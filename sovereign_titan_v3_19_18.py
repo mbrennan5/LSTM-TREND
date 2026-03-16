@@ -482,29 +482,35 @@ def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
 # Uses FRICTION_MASTER_DB parquet columns directly as features and
 # EASE_val.shift(-1) as the regression target — no OHLCV download needed.
 # ==============================================================================
-# EASE_val is the regression target (shifted -1 → T_FINAL); EXP_val / DIR_val
-# are retained as features.  'date' is promoted to the index on load.
-_EASE_SKIP_COLS = {'symbol', 'EASE_val', 'T_FINAL'}
+# EXP_val / DIR_val are other-brain outputs — ignored for EASE.
+# EASE_val is both the sole feature and (shifted -1) the regression target.
+# 'date' is promoted to the index on load.
+_EASE_SKIP_COLS = {'symbol', 'EXP_val', 'DIR_val', 'T_FINAL'}
 EASE_DATE_MIN: pd.Timestamp | None = None   # set on first parquet load
 EASE_DATE_MAX: pd.Timestamp | None = None   # set on first parquet load
+def _ensure_ease_db_loaded():
+    """Load the EASE parquet into _EASE_DB if not already done. No symbol processing."""
+    global _EASE_DB, EASE_DATE_MIN, EASE_DATE_MAX
+    if _EASE_DB is not None:
+        return
+    print(f"📂 Loading EASE parquet: {EASE_DB_PATH}")
+    _EASE_DB = pd.read_parquet(EASE_DB_PATH)
+    if 'date' in _EASE_DB.columns:
+        _EASE_DB['date'] = pd.to_datetime(_EASE_DB['date'])
+        _EASE_DB = _EASE_DB.set_index('date')
+    else:
+        _EASE_DB.index = pd.to_datetime(_EASE_DB.index)
+    EASE_DATE_MIN = _EASE_DB.index.min()
+    EASE_DATE_MAX = _EASE_DB.index.max()
+    print(f"   ✅ {len(_EASE_DB):,} rows | {_EASE_DB['symbol'].nunique()} symbols")
+    print(f"   📅 EASE test range: {EASE_DATE_MIN.date()} → {EASE_DATE_MAX.date()}")
 def load_ease_from_parquet(symbol_list):
     """Build EASE master_df from parquet; returns DataFrame with T_FINAL set.
     Test-range dates are derived from the parquet 'date' column (no hardcoded dates).
     """
-    global _EASE_DB, EASE_DATE_MIN, EASE_DATE_MAX
-    if _EASE_DB is None:
-        print(f"📂 Loading EASE parquet: {EASE_DB_PATH}")
-        _EASE_DB = pd.read_parquet(EASE_DB_PATH)
-        # 'date' is a column in the parquet — promote it to a datetime index
-        if 'date' in _EASE_DB.columns:
-            _EASE_DB['date'] = pd.to_datetime(_EASE_DB['date'])
-            _EASE_DB = _EASE_DB.set_index('date')
-        else:
-            _EASE_DB.index = pd.to_datetime(_EASE_DB.index)
-        EASE_DATE_MIN = _EASE_DB.index.min()
-        EASE_DATE_MAX = _EASE_DB.index.max()
-        print(f"   ✅ {len(_EASE_DB):,} rows | {_EASE_DB['symbol'].nunique()} symbols")
-        print(f"   📅 EASE test range: {EASE_DATE_MIN.date()} → {EASE_DATE_MAX.date()}")
+    _ensure_ease_db_loaded()
+    if not symbol_list:
+        return pd.DataFrame()
     all_data = []
     sym_col  = 'symbol' in _EASE_DB.columns
     for sym in tqdm(symbol_list, desc="⚙ EASE (parquet)"):
@@ -745,10 +751,8 @@ for BRAIN in BRAINS_TO_RUN:
         print(f"{'─'*55}")
         if BRAIN == 'EASE':
             # ── EASE: symbols + data come entirely from the parquet ────────────
-            # load_ease_from_parquet initialises _EASE_DB on first call;
-            # call with full pool so the cache is warm for the symbol sample.
-            if _EASE_DB is None:
-                load_ease_from_parquet([])   # warm the cache (returns empty df)
+            # Ensure parquet is loaded, then sample the symbol pool.
+            _ensure_ease_db_loaded()
             POOL      = list(_EASE_DB['symbol'].value_counts()
                              .head(num_symbols).index)
             master_df = load_ease_from_parquet(POOL)
