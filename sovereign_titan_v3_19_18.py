@@ -478,13 +478,11 @@ def load_hybrid_data_parallel(brain_name, symbol_list, dl_workers=20):
     print(f"   ✅ {len(all_data)} symbols processed")
     return pd.concat(all_data, axis=0)
 # ==============================================================================
-# ### BLOCK 4B: EASE PARQUET LOADER (replaces yfinance for EASE brain only)
-# Uses FRICTION_MASTER_DB parquet columns directly as features and
-# EASE_val.shift(-1) as the regression target — no OHLCV download needed.
+# ### BLOCK 4B: EASE PARQUET HELPERS
+# EASE brain uses the SAME OHLCV → LENS_*/WIN_* feature pipeline as DIR/EXP.
+# The EASE parquet supplies EASE_val, which becomes the regression target
+# (next-day EASE_val).  'date' is promoted to the index on parquet load.
 # ==============================================================================
-# EXP_val / DIR_val are other-brain outputs — ignored for EASE.
-# EASE_val is both the sole feature and (shifted -1) the regression target.
-# 'date' is promoted to the index on load.
 _EASE_SKIP_COLS = {'symbol', 'EXP_val', 'DIR_val', 'T_FINAL'}
 EASE_DATE_MIN: pd.Timestamp | None = None   # set on first parquet load
 EASE_DATE_MAX: pd.Timestamp | None = None   # set on first parquet load
@@ -533,6 +531,42 @@ def load_ease_from_parquet(symbol_list):
     result = pd.concat(all_data, axis=0)
     print(f"   ✅ {len(all_data)} EASE symbols built from parquet ({len(result):,} rows)")
     return result
+def load_ease_brain_data(symbol_list):
+    """EASE brain data loader.
+
+    1. Download OHLCV + build the full LENS_*/WIN_* feature set (same as DIR/EXP).
+    2. Join EASE_val from the parquet by (date, symbol).
+    3. Replace T_FINAL with next-day EASE_val (regression target).
+
+    Returns a master_df ready for run_judicial_audit with regression=True.
+    """
+    master_df = load_hybrid_data_parallel('EASE', symbol_list)
+    if master_df.empty:
+        return master_df
+    _ensure_ease_db_loaded()
+    # Build a flat (date, symbol, EASE_val) lookup from the parquet
+    ease_ref = (_EASE_DB[['symbol', 'EASE_val']]
+                .reset_index()
+                .rename(columns={_EASE_DB.index.name or 'date': '_ease_date'}))
+    ease_ref['_ease_date'] = pd.to_datetime(ease_ref['_ease_date']).dt.normalize()
+    # master_df index is the date column — reset so we can merge on it
+    mdf      = master_df.reset_index()
+    date_col = mdf.columns[0]
+    mdf[date_col] = pd.to_datetime(mdf[date_col]).dt.normalize()
+    mdf = mdf.merge(
+        ease_ref.rename(columns={'_ease_date': date_col}),
+        on=[date_col, 'symbol'],
+        how='left',
+    )
+    # Next-day EASE_val per symbol becomes the regression target
+    mdf = mdf.sort_values([date_col, 'symbol'])
+    mdf['T_FINAL'] = mdf.groupby('symbol')['EASE_val'].shift(-1)
+    mdf = mdf.drop(columns=['EASE_val'])
+    mdf = mdf.dropna(subset=['T_FINAL'])
+    mdf = mdf.set_index(date_col)
+    n_sym = mdf['symbol'].nunique() if 'symbol' in mdf.columns else '?'
+    print(f"   ✅ EASE brain: {n_sym} symbols | {len(mdf):,} rows with EASE target attached")
+    return mdf
 # ==============================================================================
 # ### BLOCK 5: GPU-ACCELERATED AUDIT
 # ==============================================================================
@@ -572,17 +606,9 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
                        seq_len=10, epochs=5, batch_size=1024):
     regression = (brain_name == 'EASE')
     # ── Feature column selection ───────────────────────────────────────────────
-    if regression:
-        # Use all numeric parquet columns; skip metadata / target-adjacent cols
-        feature_cols = [
-            c for c in master_df.columns
-            if c not in _EASE_SKIP_COLS
-            and master_df[c].dtype in (np.float32, np.float64, np.int32, np.int64)
-            and c != 'T_FINAL'
-        ]
-    else:
-        feature_cols = [c for c in master_df.columns
-                        if c.startswith('LENS_') or c.startswith('WIN_')]
+    # All brains (including EASE) use the engineered LENS_*/WIN_* features
+    feature_cols = [c for c in master_df.columns
+                    if c.startswith('LENS_') or c.startswith('WIN_')]
     n_features = len(feature_cols)
     # ── X scaling ─────────────────────────────────────────────────────────────
     scaler   = RobustScaler()
@@ -750,12 +776,14 @@ for BRAIN in BRAINS_TO_RUN:
         print(f"  Iteration {it}/{num_iters}  —  Brain: {BRAIN}")
         print(f"{'─'*55}")
         if BRAIN == 'EASE':
-            # ── EASE: symbols + data come entirely from the parquet ────────────
-            # Ensure parquet is loaded, then sample the symbol pool.
+            # ── EASE: same OHLCV→LENS pipeline as DIR/EXP; next-day EASE_val
+            # is the regression target, joined from the parquet by (date, symbol).
+            # Only symbols present in both TITAN_SYMBOLS and the parquet are used.
             _ensure_ease_db_loaded()
-            POOL      = list(_EASE_DB['symbol'].value_counts()
-                             .head(num_symbols).index)
-            master_df = load_ease_from_parquet(POOL)
+            parquet_syms = set(_EASE_DB['symbol'].unique())
+            avail = [s for s in TITAN_SYMBOLS if s in parquet_syms]
+            POOL  = random.sample(avail, min(num_symbols, len(avail)))
+            master_df = load_ease_brain_data(POOL)
         else:
             POOL      = random.sample(TITAN_SYMBOLS, min(num_symbols, len(TITAN_SYMBOLS)))
             master_df = load_hybrid_data_parallel(BRAIN, POOL)
