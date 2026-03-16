@@ -56,7 +56,7 @@ if not os.path.exists('/content/drive'):
     drive.mount('/content/drive', force_remount=True)
 EASE_DB_PATH    = '/content/drive/MyDrive/backtest_results/FRICTION_MASTER_DB.parquet'
 _EASE_DB        = None   # lazy-loaded on first EASE iteration
-_EASE_SKIP_COLS = frozenset({'symbol', 'EASE_val', 'EXP_val', 'DIR_val', 'T_FINAL'})
+_EASE_SKIP_COLS = frozenset({'symbol', 'T_FINAL'})
 TEST_NAME        = "Sovereign_Titan_v3.19.18_Entropy_Injection"
 OUTPUT_DRIVE_DIR = f'/content/drive/MyDrive/judicial_results/{TEST_NAME}/'
 if not os.path.exists(OUTPUT_DRIVE_DIR):
