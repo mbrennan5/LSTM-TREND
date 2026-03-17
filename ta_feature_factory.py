@@ -851,11 +851,6 @@ def run_lookback_tester():
         n, desc, fam = _CAT_BY_KEY[key]
         print(f"    {n:>2}. [{fam:<10}] {desc}")
 
-    # ── Lookback lists ─────────────────────────────────────────────────────────
-    print()
-    raw_ind = input("indicator_n values to test (e.g. 5,10,20,30,40,60): ").strip()
-    raw_z   = input("z_n values to test         (e.g. 5,10,20,30,40,60): ").strip()
-
     def _parse_csv_ints(s: str) -> list[int]:
         out = []
         for tok in s.split(','):
@@ -864,64 +859,86 @@ def run_lookback_tester():
                 out.append(int(tok))
         return sorted(set(out))
 
-    ind_list = _parse_csv_ints(raw_ind)
-    z_list   = _parse_csv_ints(raw_z)
-
-    if not ind_list or not z_list:
-        print("⚠️  No valid values parsed. Exiting."); return pd.DataFrame()
-
-    # ── Other inputs ───────────────────────────────────────────────────────────
+    # ── Other inputs (asked once, reused across all grid rounds) ──────────────
     brain_ch    = input("Brain (1:DIR / 2:EXP) [default 1]: ").strip() or "1"
     brain_name  = {'1': 'DIRECTION', '2': 'EXP'}.get(brain_ch, 'DIRECTION')
     model_type  = 'GRU' if brain_name == 'DIRECTION' else 'LSTM'
     num_symbols = int(input("Symbols per eval (e.g. 30): ") or "30")
 
-    # ── Random 3-year window within the last 15 years ─────────────────────────
+    # ── Random 3-year window (fixed for the entire session) ───────────────────
     cy   = 2026
     sy   = random.randint(cy - 15, cy - 3)
     sm   = random.randint(1, 12)
     start_date = datetime.date(sy, sm, 1)
     end_date   = start_date + datetime.timedelta(days=3 * 365)
+    symbols    = random.sample(TITAN_SYMBOLS, min(num_symbols, len(TITAN_SYMBOLS)))
+
+    print(f"\n  Session window : {start_date} → {end_date}  (3 years)")
+    print(f"  Brain          : {brain_name}  ({model_type})")
+    print(f"  Symbol pool    : {num_symbols} symbols (fixed for session)\n")
 
     import itertools
-    grid = list(itertools.product(ind_list, z_list))
+    ledger     = pd.DataFrame()
+    run_number = 0
 
-    print(f"\n{'─'*68}")
-    print(f"  Test window    : {start_date} → {end_date}  (3 years)")
-    print(f"  Brain          : {brain_name}  ({model_type})")
-    print(f"  indicator_n    : {ind_list}")
-    print(f"  z_n            : {z_list}")
-    print(f"  Combinations   : {len(grid)}  ({len(ind_list)} × {len(z_list)})")
-    print(f"  Features       : {len(selected)}  →  {len(selected)*3} LENS columns per pair")
-    print(f"{'─'*68}\n")
+    # ── Continuous loop — keep asking for new lookback lists ──────────────────
+    while True:
+        run_number += 1
+        print(f"\n{'─'*68}")
+        print(f"  LOOKBACK ROUND {run_number}  (enter 'done' to finish and run final audit)")
+        print(f"{'─'*68}")
 
-    # ── Sample symbols once (same pool for all evals) ─────────────────────────
-    symbols = random.sample(TITAN_SYMBOLS, min(num_symbols, len(TITAN_SYMBOLS)))
+        raw_ind = input("indicator_n values to test (e.g. 5,10,20,30,40,60): ").strip()
+        if raw_ind.lower() == 'done':
+            break
+        raw_z = input("z_n values to test         (e.g. 5,10,20,30,40,60): ").strip()
+        if raw_z.lower() == 'done':
+            break
 
-    # ── Exhaustive grid over specified lookback combinations ──────────────────
-    best_acc, best_ind_n, best_z_n = -1.0, ind_list[0], z_list[0]
-    results: list[tuple] = []
-    for i, (ind_n, z_n) in enumerate(grid, 1):
-        print(f"\n[{i}/{len(grid)}] Testing ind_n={ind_n}  z_n={z_n} …")
-        acc = 1.0 - _bo_objective(
-            [ind_n, z_n],
-            symbols, start_date, end_date,
-            selected, brain_name, model_type,
-        )
-        results.append((ind_n, z_n, acc))
-        if acc > best_acc:
-            best_acc, best_ind_n, best_z_n = acc, ind_n, z_n
+        ind_list = _parse_csv_ints(raw_ind)
+        z_list   = _parse_csv_ints(raw_z)
 
-    # ── Results table ──────────────────────────────────────────────────────────
-    print(f"\n{'═'*68}")
-    print("  GRID SEARCH — FULL RESULTS")
-    print(f"  {'#':>3}  {'ind_n':>6}  {'z_n':>5}  {'acc':>8}")
-    print(f"  {'─'*35}")
-    for i, (ind_n, z_n, acc) in enumerate(results, 1):
-        marker = " ← best" if (ind_n == best_ind_n and z_n == best_z_n) else ""
-        print(f"  {i:>3}  {ind_n:>6}  {z_n:>5}  {acc:>8.4f}{marker}")
+        if not ind_list or not z_list:
+            print("⚠️  No valid values parsed — try again."); continue
 
-    # ── Final audit at optimal pair ────────────────────────────────────────────
+        grid = list(itertools.product(ind_list, z_list))
+        print(f"\n  indicator_n : {ind_list}")
+        print(f"  z_n         : {z_list}")
+        print(f"  Combinations: {len(grid)}  ({len(ind_list)} × {len(z_list)})")
+        print(f"  Features    : {len(selected)}  →  {len(selected)*3} LENS cols per pair\n")
+
+        # ── Grid over this round's combinations ────────────────────────────────
+        best_acc, best_ind_n, best_z_n = -1.0, ind_list[0], z_list[0]
+        results: list[tuple] = []
+        for i, (ind_n, z_n) in enumerate(grid, 1):
+            print(f"\n[{i}/{len(grid)}] Testing ind_n={ind_n}  z_n={z_n} …")
+            acc = 1.0 - _bo_objective(
+                [ind_n, z_n],
+                symbols, start_date, end_date,
+                selected, brain_name, model_type,
+            )
+            results.append((ind_n, z_n, acc))
+            if acc > best_acc:
+                best_acc, best_ind_n, best_z_n = acc, ind_n, z_n
+
+        # ── Round results table ────────────────────────────────────────────────
+        print(f"\n{'═'*68}")
+        print(f"  ROUND {run_number} RESULTS")
+        print(f"  {'#':>3}  {'ind_n':>6}  {'z_n':>5}  {'acc':>8}")
+        print(f"  {'─'*35}")
+        for i, (ind_n, z_n, acc) in enumerate(results, 1):
+            marker = " ← best" if (ind_n == best_ind_n and z_n == best_z_n) else ""
+            print(f"  {i:>3}  {ind_n:>6}  {z_n:>5}  {acc:>8.4f}{marker}")
+        print(f"\n  Round best: ind_n={best_ind_n}  z_n={best_z_n}  acc={best_acc:.4f}")
+
+        again = input("\n  Enter next lookback list or 'done' to audit best pair: ").strip().lower()
+        if again == 'done':
+            break
+
+    # ── Final audit at best pair across all rounds ────────────────────────────
+    if best_ind_n is None:
+        print("⚠️  No rounds completed."); return pd.DataFrame()
+
     print(f"\n{'═'*68}")
     print(f"  🏆 OPTIMAL PAIR: indicator_n={best_ind_n}  z_n={best_z_n}")
     print(f"     Validation accuracy = {best_acc:.4f}")
