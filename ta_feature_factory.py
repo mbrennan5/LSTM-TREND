@@ -9,13 +9,14 @@
 #   3. Exhaustive grid search over the (indicator_n × z_n) joint space
 #   4. Multi-horizon evaluation — grid scored across N forward-day targets
 #   5. Iteration averaging — each grid point run N times for stable estimates
+#   6. Live per-iteration tables + consolidated final scored table
 #
 # Mandate (Sovereign framework):
 #   Never optimise the seed in isolation. indicator_n and z_n are COUPLED.
 #   Grid finds the joint optimum; GA-style filtering is left to the BRAIN_LOCKS.
 # ==============================================================================
 from __future__ import annotations
-import os, gc, warnings, datetime, random, functools, logging
+import os, gc, warnings, datetime, random, itertools, logging
 warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 logging.getLogger('peewee').setLevel(logging.CRITICAL)
@@ -55,10 +56,10 @@ print(f"[SYSTEM] Active compute device: {DEVICE}\n")
 # ==============================================================================
 import numpy as np, pandas as pd, yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from tensorflow.keras.models    import Sequential
-from tensorflow.keras.layers    import GRU, LSTM, Dense, Input, Dropout
+from tensorflow.keras.models     import Sequential
+from tensorflow.keras.layers     import GRU, LSTM, Dense, Input, Dropout
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.callbacks  import EarlyStopping, ReduceLROnPlateau
 from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA
 from tqdm.auto import tqdm
@@ -73,8 +74,8 @@ if IN_COLAB:
 else:
     _BASE_OUT = os.path.join(os.path.dirname(__file__), 'judicial_results')
 
-TEST_NAME        = "TA_FeatureFactory_JointOpt"
-OUTPUT_DIR       = os.path.join(_BASE_OUT, TEST_NAME)
+TEST_NAME         = "TA_FeatureFactory_JointOpt"
+OUTPUT_DIR        = os.path.join(_BASE_OUT, TEST_NAME)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 N_FEATURE_WORKERS = max(1, (os.cpu_count() or 2))
 print(f"[SYSTEM] Feature workers: {N_FEATURE_WORKERS}")
@@ -99,8 +100,7 @@ TITAN_SYMBOLS = [
 ]
 
 # ==============================================================================
-# FEATURE CATALOG  — numbered reference for the interactive per-run selector
-# (num, internal_key, display_description, family)
+# FEATURE CATALOG
 # ==============================================================================
 FEATURE_CATALOG: list[tuple] = [
     ( 1, 'er',               'Efficiency Ratio (ER)',                     'Trend'),
@@ -316,24 +316,7 @@ def _warm_up_numba():
 _warm_up_numba()
 
 # ==============================================================================
-# BLOCK 3: PARAMETERISED FEATURE FACTORY  (Ron Harper 4.30 — extended)
-#
-# indicator_n  — primary lookback; all indicator windows scale from this:
-#     n_s  = max(5,  indicator_n // 2)   short
-#     n_m  = max(10, indicator_n)         primary / mid
-#     n_l  = max(20, indicator_n * 2)     long
-#     n_xl = max(30, indicator_n * 3)     extra-long
-#     n_atr= max(7,  indicator_n // 2)    ATR / ADX period
-#
-# z_n          — the SINGLE lens window replacing Ron Harper's fixed [10, 90].
-#                Grid searches for the optimal z_n jointly with indicator_n.
-#
-# selected_features — list of keys from FEATURE_CATALOG.
-#                     All intermediates are always computed; only selected
-#                     seeds enter the Z-lens and appear as LENS_* columns.
-#
-# forward_days — if provided, T_FINAL columns are generated for each horizon:
-#                T_FINAL_1d, T_FINAL_3d, etc.  T_FINAL (1d default) always set.
+# BLOCK 3: PARAMETERISED FEATURE FACTORY
 # ==============================================================================
 def generate_factory_features_v2(df: pd.DataFrame,
                                   indicator_n: int = 20,
@@ -351,9 +334,10 @@ def generate_factory_features_v2(df: pd.DataFrame,
 
     # ── Multi-horizon targets ─────────────────────────────────────────────────
     for fwd in forward_days:
-        col = f'T_FINAL_{fwd}d'
-        df[col] = np.where(df['close'].shift(-fwd) > df['close'], 1, 0)
-    # Keep T_FINAL (1-day) as the default for backward compatibility
+        df[f'T_FINAL_{fwd}d'] = np.where(
+            df['close'].shift(-fwd) > df['close'], 1, 0
+        )
+    # T_FINAL = first forward day (backward compat / dropna anchor)
     df['T_FINAL'] = df[f'T_FINAL_{forward_days[0]}d']
 
     hlc = df['hlc3'].values.astype(np.float64)
@@ -404,13 +388,13 @@ def generate_factory_features_v2(df: pd.DataFrame,
     linreg_s  = _rolling_linslope(hlc, n_s)
     linreg_m  = _rolling_linslope(hlc, n_m)
     linreg_xl = _rolling_linslope(hlc, n_xl)
-    slope_std = np.nanstd(linreg_m) + 1e-9
+    slope_std  = np.nanstd(linreg_m) + 1e-9
     logistic_m = 1.0 / (1.0 + np.exp(-linreg_m / slope_std))
 
     # ── MTSI ──────────────────────────────────────────────────────────────────
-    tp_v = pd.Series(hlc * vol, index=idx)
-    vs   = pd.Series(vol, index=idx)
-    cs   = pd.Series(cl,  index=idx)
+    tp_v  = pd.Series(hlc * vol, index=idx)
+    vs    = pd.Series(vol, index=idx)
+    cs    = pd.Series(cl,  index=idx)
     _mtsi = (cs - (tp_v.rolling(2).sum() /
                    (vs.rolling(2).sum() + 1e-9))).ewm(span=3).mean().values  # noqa
 
@@ -474,47 +458,42 @@ def generate_factory_features_v2(df: pd.DataFrame,
     rsq_h    = r_sq_m / (hurst_l+1e-9)
     vhf_adx  = vhf / (adx+1e-9)
 
-    # ── Full seed dict ─────────────────────────────────────────────────────────
     SEEDS: dict[str, pd.Series] = {
-        'er':               pd.Series(er_m,       index=idx),
-        'vidya_cmo':        pd.Series(vidya_cmo_m, index=idx),
-        'r_sq':             pd.Series(r_sq_m,      index=idx),
-        'hurst':            pd.Series(hurst_l,     index=idx),
-        'shannon':          pd.Series(shannon_m,   index=idx),
-        'adx':              pd.Series(adx,         index=idx),
-        'logistic_prob':    pd.Series(logistic_m,  index=idx),
-        'aroon_up':         pd.Series(aroon,       index=idx),
-        'donchian_l':       pd.Series(don_l,       index=idx),
-        'dispersion':       pd.Series(disp,        index=idx),
-        'lr_slope':         pd.Series(linreg_m,    index=idx),
-        'tema_s_pct':       pd.Series(tema_s_pct,  index=idx),
-        'tema_m_pct':       pd.Series(tema_m_pct,  index=idx),
-        'sma_xs_pct':       pd.Series(sma_xs_pct,  index=idx),
-        'sma_m_pct':        pd.Series(sma_m_pct,   index=idx),
-        'hma_m_pct':        pd.Series(hma_m_pct,   index=idx),
-        'kalman_pct':       pd.Series(kalman_pct,  index=idx),
-        'kalman_sma_ratio': pd.Series(kal_sma,     index=idx),
-        'tema_kal_ratio':   pd.Series(tema_kal,    index=idx),
-        'exhaustion':       pd.Series(exh,         index=idx),
-        'exhaustion_xl':    pd.Series(exh_xl,      index=idx),
-        'ratio_acc':        pd.Series(r_acc,       index=idx),
-        'ratio_snr':        pd.Series(r_snr,       index=idx),
-        'curvature_diff':   pd.Series(curv,        index=idx),
-        'cycle_vs_trend':   pd.Series(cyc_tr,      index=idx),
-        'ratio_eff_slope':  pd.Series(r_eff,       index=idx),
-        'ratio_pers_slope': pd.Series(r_pers,      index=idx),
-        'ratio_struct':     pd.Series(r_str,       index=idx),
-        'adx_entropy':      pd.Series(adx_ent,     index=idx),
-        'breakout_eff':     pd.Series(bk_eff,      index=idx),
-        'r_sq_hurst':       pd.Series(rsq_h,       index=idx),
-        'vhf_adx':          pd.Series(vhf_adx,     index=idx),
+        'er':               pd.Series(er_m,        index=idx),
+        'vidya_cmo':        pd.Series(vidya_cmo_m,  index=idx),
+        'r_sq':             pd.Series(r_sq_m,       index=idx),
+        'hurst':            pd.Series(hurst_l,      index=idx),
+        'shannon':          pd.Series(shannon_m,    index=idx),
+        'adx':              pd.Series(adx,          index=idx),
+        'logistic_prob':    pd.Series(logistic_m,   index=idx),
+        'aroon_up':         pd.Series(aroon,        index=idx),
+        'donchian_l':       pd.Series(don_l,        index=idx),
+        'dispersion':       pd.Series(disp,         index=idx),
+        'lr_slope':         pd.Series(linreg_m,     index=idx),
+        'tema_s_pct':       pd.Series(tema_s_pct,   index=idx),
+        'tema_m_pct':       pd.Series(tema_m_pct,   index=idx),
+        'sma_xs_pct':       pd.Series(sma_xs_pct,   index=idx),
+        'sma_m_pct':        pd.Series(sma_m_pct,    index=idx),
+        'hma_m_pct':        pd.Series(hma_m_pct,    index=idx),
+        'kalman_pct':       pd.Series(kalman_pct,   index=idx),
+        'kalman_sma_ratio': pd.Series(kal_sma,      index=idx),
+        'tema_kal_ratio':   pd.Series(tema_kal,     index=idx),
+        'exhaustion':       pd.Series(exh,          index=idx),
+        'exhaustion_xl':    pd.Series(exh_xl,       index=idx),
+        'ratio_acc':        pd.Series(r_acc,        index=idx),
+        'ratio_snr':        pd.Series(r_snr,        index=idx),
+        'curvature_diff':   pd.Series(curv,         index=idx),
+        'cycle_vs_trend':   pd.Series(cyc_tr,       index=idx),
+        'ratio_eff_slope':  pd.Series(r_eff,        index=idx),
+        'ratio_pers_slope': pd.Series(r_pers,       index=idx),
+        'ratio_struct':     pd.Series(r_str,        index=idx),
+        'adx_entropy':      pd.Series(adx_ent,      index=idx),
+        'breakout_eff':     pd.Series(bk_eff,       index=idx),
+        'r_sq_hurst':       pd.Series(rsq_h,        index=idx),
+        'vhf_adx':          pd.Series(vhf_adx,      index=idx),
     }
 
     # ── Apply Z-lens ONLY to selected features ────────────────────────────────
-    # Physics Trio per seed:
-    #   LENS_{z_n}_{key}_z        → Position   (where relative to history)
-    #   LENS_{z_n}_{key}_z_slope  → Velocity   (rate of change)
-    #   LENS_{z_n}_{key}_z_sos    → Acceleration / SOS  (turning-point signal)
     for name, series in SEEDS.items():
         if name not in sel:
             continue
@@ -528,7 +507,6 @@ def generate_factory_features_v2(df: pd.DataFrame,
         df[f'LENS_{z_n}_{name}_z_slope'] = zs
         df[f'LENS_{z_n}_{name}_z_sos']   = zsos
 
-    # ── CoG rolling-pct group (only when 'cog' selected) ─────────────────────
     if 'cog' in sel:
         cog_arr = cog_m.astype(np.float64)
         for win in [n_s, n_m]:
@@ -541,10 +519,9 @@ def generate_factory_features_v2(df: pd.DataFrame,
               .fillna(0))
 
 # ==============================================================================
-# BLOCK 4: PARALLEL DATA LOADER  (Ron Harper 4.30 — extended with date range)
+# BLOCK 4: PARALLEL DATA LOADER
 # ==============================================================================
 def _process_symbol_worker(args):
-    """Top-level for ProcessPoolExecutor (must be picklable)."""
     symbol, raw_dict, indicator_n, z_n, selected_features, forward_days = args
     try:
         raw_df = pd.DataFrame(raw_dict)
@@ -632,7 +609,7 @@ def load_hybrid_data_parallel(brain_name: str,
     return pd.concat(all_data, axis=0)
 
 # ==============================================================================
-# BLOCK 5: GPU-ACCELERATED AUDIT  (Ron Harper 4.30)
+# BLOCK 5: GPU-ACCELERATED AUDIT
 # ==============================================================================
 def build_full_model(model_type, n_features, seq_len, device=DEVICE):
     with tf.device(device):
@@ -661,14 +638,8 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
                        seq_len=10, epochs=30, batch_size=2048,
                        target_col: str = 'T_FINAL',
                        ) -> tuple[pd.DataFrame, float]:
-    """
-    Returns
-    -------
-    report_df     : permutation-importance DataFrame  (Feature, I_raw)
-    baseline_acc  : scalar validation accuracy
-    """
-    feat_cols = [c for c in master_df.columns
-                 if c.startswith('LENS_') or c.startswith('WIN_')]
+    feat_cols  = [c for c in master_df.columns
+                  if c.startswith('LENS_') or c.startswith('WIN_')]
     n_features = len(feat_cols)
     if n_features == 0:
         return pd.DataFrame(columns=['Feature', 'I_raw']), 0.0
@@ -683,9 +654,6 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
     split  = int(len(X_seqs) * 0.8)
     X_tr, X_val = X_seqs[:split], X_seqs[split:]
     y_tr, y_val = y_seqs[:split], y_seqs[split:]
-
-    print(f"  [DATA] train={len(X_tr):,}  val={len(X_val):,}  "
-          f"features={n_features}  target={target_col}")
 
     AUTO  = tf.data.AUTOTUNE
     tr_ds = (tf.data.Dataset.from_tensor_slices((X_tr, y_tr))
@@ -704,10 +672,9 @@ def run_judicial_audit(brain_name, master_df, model_type='GRU',
                                         patience=3, min_lr=1e-5),
                   ], verbose=1)
 
-    Xvt = tf.constant(X_val)
-    yvt = tf.constant(y_val)
+    Xvt          = tf.constant(X_val)
+    yvt          = tf.constant(y_val)
     baseline_acc = float(_eval_accuracy(model, Xvt, yvt).numpy())
-    print(f"  [MODEL] Val accuracy ({target_col}): {baseline_acc:.4f}")
 
     rows = []
     for fi, fname in enumerate(tqdm(feat_cols, desc="Permutation scoring")):
@@ -732,9 +699,9 @@ BRAIN_LOCKS: dict[str, list] = {'DIRECTION': [], 'EASE': [], 'EXP': []}
 def _parse_feature_name(f):
     XFORM = {'z', 'slope', 'sos', 'pct'}
     if f.startswith('LENS_') or f.startswith('WIN_'):
-        parts = f.split('_')
+        parts  = f.split('_')
         prefix, window = parts[0], parts[1]
-        rem = list(parts[2:])
+        rem    = list(parts[2:])
         while rem and rem[-1] in XFORM:
             rem.pop()
         indicator = '_'.join(rem)
@@ -743,9 +710,9 @@ def _parse_feature_name(f):
     return None, None, f, f
 
 def apply_sovereign_hunt(ledger_df, master_data_df, brain_name, max_slots=19):
-    locked = BRAIN_LOCKS.get(brain_name, [])
-    cands  = ledger_df.sort_values('I_raw', ascending=False)
-    picked = [f for f in locked if f in ledger_df['Feature'].values]
+    locked  = BRAIN_LOCKS.get(brain_name, [])
+    cands   = ledger_df.sort_values('I_raw', ascending=False)
+    picked  = [f for f in locked if f in ledger_df['Feature'].values]
     for lf in locked:
         if lf not in ledger_df['Feature'].values:
             print(f"  ⚠️  BRAIN_LOCK '{lf}' not found")
@@ -806,7 +773,7 @@ def generate_judicial_ledger(brain_name, report_df, master_data_df, iteration=1)
     return df[df['Feature'].isin(picks)]
 
 # ==============================================================================
-# GRID SEARCH OBJECTIVE
+# GRID SEARCH OBJECTIVE — returns per-horizon accuracy dict
 # ==============================================================================
 def _evaluate_pair(ind_n: int, z_n: int,
                    symbols: list,
@@ -815,9 +782,10 @@ def _evaluate_pair(ind_n: int, z_n: int,
                    brain_name: str,
                    model_type: str,
                    forward_days: list[int],
-                   ) -> float:
+                   ) -> dict[int, float]:
     """
-    Load data once, evaluate across all forward-day horizons, return mean accuracy.
+    Load data once, evaluate each forward-day horizon independently.
+    Returns {fwd_day: accuracy} — caller computes the mean.
     """
     master_df = load_hybrid_data_parallel(
         brain_name, symbols,
@@ -827,22 +795,99 @@ def _evaluate_pair(ind_n: int, z_n: int,
         start_date=start_date, end_date=end_date,
     )
     if master_df.empty or len(master_df) < 500:
-        return 0.0
+        return {fwd: 0.0 for fwd in forward_days}
 
-    horizon_accs: list[float] = []
+    horizon_accs: dict[int, float] = {}
     for fwd in forward_days:
         target_col = f'T_FINAL_{fwd}d'
         if target_col not in master_df.columns:
+            horizon_accs[fwd] = 0.0
             continue
         _, acc = run_judicial_audit(
             brain_name, master_df,
             model_type=model_type,
             target_col=target_col,
         )
-        horizon_accs.append(acc)
-        print(f"    fwd={fwd}d  acc={acc:.4f}")
+        horizon_accs[fwd] = acc
 
-    return float(np.mean(horizon_accs)) if horizon_accs else 0.0
+    return horizon_accs
+
+
+def _print_iter_table(combo_i: int, n_combos: int,
+                      ind_n: int, z_n: int,
+                      it: int, n_iterations: int,
+                      horizon_accs: dict[int, float],
+                      forward_days: list[int]) -> None:
+    """Print the per-horizon results table for a single iteration."""
+    mean_acc = float(np.mean([horizon_accs[d] for d in forward_days]))
+    col_w    = 8
+    hdr      = "  ".join(f"fwd-{d:>2d}d" for d in forward_days)
+    val      = "  ".join(f"{horizon_accs[d]:>{col_w}.4f}" for d in forward_days)
+    sep      = "─" * (len(hdr) + len(val) + 20)
+    print(f"\n  ┌─ Combo [{combo_i}/{n_combos}]  ind_n={ind_n}  z_n={z_n}"
+          f"  iter {it}/{n_iterations}")
+    print(f"  │  {hdr}   {'MEAN':>{col_w}}")
+    print(f"  │  {'─'*(len(hdr)+col_w+2)}")
+    print(f"  │  {val}   {mean_acc:>{col_w}.4f}")
+    print(f"  └{'─'*max(10, len(sep)//2)}")
+
+
+def _print_consolidated_table(results: list[tuple],
+                               forward_days: list[int],
+                               best_ind_n: int, best_z_n: int) -> None:
+    """
+    Print the final consolidated scored table, sorted by mean_acc descending.
+
+    results entries: (ind_n, z_n, mean_acc, iter_data)
+      iter_data: list of dict[int, float]  — one dict per iteration
+    """
+    # ── Build per-horizon means across iterations ──────────────────────────────
+    rows = []
+    for ind_n, z_n, mean_acc, iter_data in results:
+        row = {'ind_n': ind_n, 'z_n': z_n, 'mean_acc': mean_acc}
+        # mean accuracy per forward horizon across all iterations
+        for fwd in forward_days:
+            vals = [it_d.get(fwd, 0.0) for it_d in iter_data]
+            row[f'fwd_{fwd}d'] = float(np.mean(vals))
+        row['std_acc'] = float(np.std([
+            np.mean([it_d.get(fwd, 0.0) for fwd in forward_days])
+            for it_d in iter_data
+        ]))
+        rows.append(row)
+
+    # Sort by mean_acc descending
+    rows.sort(key=lambda r: r['mean_acc'], reverse=True)
+
+    # ── Column widths ──────────────────────────────────────────────────────────
+    fwd_cols   = [f'fwd_{d}d' for d in forward_days]
+    fwd_labels = [f'{d:>5d}d' for d in forward_days]
+    col_w      = 8
+
+    hdr_fwds = "  ".join(f"{lbl:>{col_w}}" for lbl in fwd_labels)
+    sep_line  = "═" * (6 + 6 + 5 + (col_w + 2) * len(forward_days) + col_w + 8 + 8 + 10)
+
+    print(f"\n{'═'*len(sep_line)}")
+    print("  CONSOLIDATED RESULTS — sorted by mean accuracy (desc)")
+    print(f"{'═'*len(sep_line)}")
+    print(f"  {'RNK':>3}  {'ind_n':>6}  {'z_n':>5}  "
+          + hdr_fwds
+          + f"  {'MEAN':>{col_w}}  {'STD':>{col_w}}")
+    print(f"  {'─'*(len(sep_line)-2)}")
+
+    for rank, row in enumerate(rows, 1):
+        is_best = (row['ind_n'] == best_ind_n and row['z_n'] == best_z_n)
+        marker  = " ◄ BEST" if is_best else ""
+        fwd_vals = "  ".join(f"{row[c]:>{col_w}.4f}" for c in fwd_cols)
+        print(f"  {rank:>3}  {row['ind_n']:>6}  {row['z_n']:>5}  "
+              + fwd_vals
+              + f"  {row['mean_acc']:>{col_w}.4f}  {row['std_acc']:>{col_w}.4f}"
+              + marker)
+
+    print(f"\n  🏆 OPTIMAL PAIR: indicator_n={best_ind_n}  z_n={best_z_n}")
+    best_row = next(r for r in rows if r['ind_n'] == best_ind_n and r['z_n'] == best_z_n)
+    print(f"     Mean val accuracy = {best_row['mean_acc']:.4f}  "
+          f"std = {best_row['std_acc']:.4f}")
+    print(f"{'═'*len(sep_line)}\n")
 
 # ==============================================================================
 # ENTRY POINT
@@ -868,7 +913,7 @@ def run_lookback_tester():
 
     # ── Forward-day targets ────────────────────────────────────────────────────
     print()
-    raw_fwd     = input("Forward days to score (e.g. 1,3,5,10): ").strip()
+    raw_fwd      = input("Forward days to score (e.g. 1,3,5,10): ").strip()
     forward_days = [int(x.strip()) for x in raw_fwd.split(',')
                     if x.strip().isdigit() and int(x.strip()) > 0]
     if not forward_days:
@@ -876,7 +921,7 @@ def run_lookback_tester():
         print("  (no valid values — defaulting to 1 day)")
 
     # ── Iterations per grid point ──────────────────────────────────────────────
-    raw_iters   = input("Iterations per combo before deciding [default 1]: ").strip()
+    raw_iters    = input("Iterations per combo before deciding [default 1]: ").strip()
     n_iterations = int(raw_iters) if raw_iters.isdigit() and int(raw_iters) >= 1 else 1
 
     # ── Lookback lists ─────────────────────────────────────────────────────────
@@ -910,75 +955,80 @@ def run_lookback_tester():
     start_date = datetime.date(sy, sm, 1)
     end_date   = start_date + datetime.timedelta(days=3 * 365)
 
-    import itertools
     grid = list(itertools.product(ind_list, z_list))
 
     print(f"\n{'─'*68}")
-    print(f"  Test window    : {start_date} → {end_date}  (3 years)")
-    print(f"  Brain          : {brain_name}  ({model_type})")
-    print(f"  indicator_n    : {ind_list}")
-    print(f"  z_n            : {z_list}")
-    print(f"  Combinations   : {len(grid)}  ({len(ind_list)} × {len(z_list)})")
-    print(f"  Forward days   : {forward_days}")
+    print(f"  Test window     : {start_date} → {end_date}  (3 years)")
+    print(f"  Brain           : {brain_name}  ({model_type})")
+    print(f"  indicator_n     : {ind_list}")
+    print(f"  z_n             : {z_list}")
+    print(f"  Combinations    : {len(grid)}  ({len(ind_list)} × {len(z_list)})")
+    print(f"  Forward days    : {forward_days}")
     print(f"  Iterations/combo: {n_iterations}")
-    print(f"  Features       : {len(selected)}  →  {len(selected)*3} LENS columns per pair")
+    print(f"  Features        : {len(selected)}  →  {len(selected)*3} LENS columns per pair")
     print(f"{'─'*68}\n")
 
     # ── Exhaustive grid ────────────────────────────────────────────────────────
+    # results: list of (ind_n, z_n, mean_acc, iter_data)
+    #   iter_data: list[dict[int, float]]  — one dict per iteration, keyed by fwd day
     best_acc, best_ind_n, best_z_n = -1.0, ind_list[0], z_list[0]
-    results: list[tuple] = []   # (ind_n, z_n, mean_acc, [iter_accs])
+    results: list[tuple] = []
 
     for combo_i, (ind_n, z_n) in enumerate(grid, 1):
-        print(f"\n[{combo_i}/{len(grid)}] ind_n={ind_n}  z_n={z_n} — "
-              f"{n_iterations} iteration(s) × {len(forward_days)} horizon(s)")
+        print(f"\n{'━'*68}")
+        print(f"  COMBO [{combo_i}/{len(grid)}]  ind_n={ind_n}  z_n={z_n}"
+              f"  |  {n_iterations} iter × {len(forward_days)} horizon(s)")
+        print(f"{'━'*68}")
 
-        iter_accs: list[float] = []
+        iter_data:  list[dict[int, float]] = []
+        iter_means: list[float]            = []
+
         for it in range(1, n_iterations + 1):
-            # Fresh random symbol draw each iteration for independent estimates
+            # Fresh random symbol draw each iteration
             symbols = random.sample(TITAN_SYMBOLS, min(num_symbols, len(TITAN_SYMBOLS)))
-            print(f"  iter {it}/{n_iterations}  symbols={len(symbols)}")
-            acc = _evaluate_pair(
+            print(f"\n  ── iter {it}/{n_iterations}  ({len(symbols)} symbols) ──")
+
+            horizon_accs = _evaluate_pair(
                 ind_n, z_n,
                 symbols, start_date, end_date,
                 selected, brain_name, model_type, forward_days,
             )
-            iter_accs.append(acc)
-            print(f"  → iter {it} mean-horizon acc = {acc:.4f}")
+            iter_data.append(horizon_accs)
 
-        mean_acc = float(np.mean(iter_accs))
-        std_acc  = float(np.std(iter_accs))
-        results.append((ind_n, z_n, mean_acc, iter_accs))
-        print(f"  ★ combo mean={mean_acc:.4f}  std={std_acc:.4f}")
+            it_mean = float(np.mean(list(horizon_accs.values())))
+            iter_means.append(it_mean)
 
-        if mean_acc > best_acc:
-            best_acc, best_ind_n, best_z_n = mean_acc, ind_n, z_n
+            # Print results for this iteration
+            _print_iter_table(combo_i, len(grid), ind_n, z_n,
+                              it, n_iterations, horizon_accs, forward_days)
 
-    # ── Results table ──────────────────────────────────────────────────────────
-    print(f"\n{'═'*68}")
-    print("  GRID SEARCH — FULL RESULTS")
-    iter_header = "  " + "  ".join([f"it{i+1:02d}" for i in range(n_iterations)])
-    print(f"  {'#':>3}  {'ind_n':>6}  {'z_n':>5}  {'mean_acc':>9}  {'std':>6}"
-          + (f"  {iter_header}" if n_iterations > 1 else ""))
-    print(f"  {'─'*55}")
-    for i, (ind_n, z_n, mean_acc, iter_accs) in enumerate(results, 1):
-        marker   = " ← best" if (ind_n == best_ind_n and z_n == best_z_n) else ""
-        std_acc  = float(np.std(iter_accs))
-        iter_str = ("  " + "  ".join([f"{a:.4f}" for a in iter_accs])
-                    if n_iterations > 1 else "")
-        print(f"  {i:>3}  {ind_n:>6}  {z_n:>5}  {mean_acc:>9.4f}  {std_acc:>6.4f}"
-              f"{iter_str}{marker}")
+        combo_mean = float(np.mean(iter_means))
+        combo_std  = float(np.std(iter_means))
+        results.append((ind_n, z_n, combo_mean, iter_data))
 
-    print(f"\n{'═'*68}")
-    print(f"  🏆 OPTIMAL PAIR: indicator_n={best_ind_n}  z_n={best_z_n}")
-    print(f"     Mean validation accuracy = {best_acc:.4f}  "
-          f"(across {n_iterations} iter × {len(forward_days)} horizon(s))")
-    print(f"{'═'*68}\n")
+        print(f"\n  ★ COMBO SUMMARY  ind_n={ind_n}  z_n={z_n}"
+              f"  mean={combo_mean:.4f}  std={combo_std:.4f}")
 
-    # ── Save results summary ───────────────────────────────────────────────────
-    rows = [{'ind_n': r[0], 'z_n': r[1], 'mean_acc': r[2],
-             **{f'iter_{j+1}': r[3][j] for j in range(len(r[3]))}}
-            for r in results]
-    summary_df = pd.DataFrame(rows)
+        if combo_mean > best_acc:
+            best_acc, best_ind_n, best_z_n = combo_mean, ind_n, z_n
+
+    # ── Consolidated final table ───────────────────────────────────────────────
+    _print_consolidated_table(results, forward_days, best_ind_n, best_z_n)
+
+    # ── Save CSV ───────────────────────────────────────────────────────────────
+    csv_rows = []
+    for ind_n, z_n, mean_acc, iter_data in results:
+        row: dict = {'ind_n': ind_n, 'z_n': z_n, 'mean_acc': mean_acc}
+        for fwd in forward_days:
+            vals = [it_d.get(fwd, 0.0) for it_d in iter_data]
+            row[f'fwd_{fwd}d_mean'] = float(np.mean(vals))
+        for j, it_d in enumerate(iter_data, 1):
+            row[f'iter_{j}_mean'] = float(np.mean(list(it_d.values())))
+            for fwd in forward_days:
+                row[f'iter_{j}_fwd{fwd}d'] = it_d.get(fwd, 0.0)
+        csv_rows.append(row)
+
+    summary_df = pd.DataFrame(csv_rows).sort_values('mean_acc', ascending=False)
     fname = (f"GridResults_{brain_name}_"
              f"fwd{'_'.join(str(d) for d in forward_days)}_"
              f"{_dt.now().strftime('%Y%m%d_%H%M%S')}.csv")
