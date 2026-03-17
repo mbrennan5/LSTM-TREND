@@ -878,20 +878,23 @@ def run_lookback_tester():
     print(f"  Symbol pool    : {num_symbols} symbols (fixed for session)\n")
 
     import itertools
-    ledger     = pd.DataFrame()
-    run_number = 0
+    ledger              = pd.DataFrame()
+    run_number          = 0
+    global_best_acc     = -1.0
+    global_best_ind_n   = None
+    global_best_z_n     = None
 
     # ── Continuous loop — keep asking for new lookback lists ──────────────────
     while True:
         run_number += 1
         print(f"\n{'─'*68}")
-        print(f"  LOOKBACK ROUND {run_number}  (enter 'done' to finish and run final audit)")
+        print(f"  LOOKBACK ROUND {run_number}  (type 'done' at any prompt to finish)")
         print(f"{'─'*68}")
 
-        raw_ind = input("indicator_n values to test (e.g. 5,10,20,30,40,60): ").strip()
+        raw_ind = input("indicator_n values to test (e.g. 5,10,20,30,40,60) or 'done': ").strip()
         if raw_ind.lower() == 'done':
             break
-        raw_z = input("z_n values to test         (e.g. 5,10,20,30,40,60): ").strip()
+        raw_z = input("z_n values to test         (e.g. 5,10,20,30,40,60) or 'done': ").strip()
         if raw_z.lower() == 'done':
             break
 
@@ -908,7 +911,9 @@ def run_lookback_tester():
         print(f"  Features    : {len(selected)}  →  {len(selected)*3} LENS cols per pair\n")
 
         # ── Grid over this round's combinations ────────────────────────────────
-        best_acc, best_ind_n, best_z_n = -1.0, ind_list[0], z_list[0]
+        round_best_acc   = -1.0
+        round_best_ind_n = ind_list[0]
+        round_best_z_n   = z_list[0]
         results: list[tuple] = []
         for i, (ind_n, z_n) in enumerate(grid, 1):
             print(f"\n[{i}/{len(grid)}] Testing ind_n={ind_n}  z_n={z_n} …")
@@ -918,8 +923,10 @@ def run_lookback_tester():
                 selected, brain_name, model_type,
             )
             results.append((ind_n, z_n, acc))
-            if acc > best_acc:
-                best_acc, best_ind_n, best_z_n = acc, ind_n, z_n
+            if acc > round_best_acc:
+                round_best_acc, round_best_ind_n, round_best_z_n = acc, ind_n, z_n
+            if acc > global_best_acc:
+                global_best_acc, global_best_ind_n, global_best_z_n = acc, ind_n, z_n
 
         # ── Round results table ────────────────────────────────────────────────
         print(f"\n{'═'*68}")
@@ -927,27 +934,25 @@ def run_lookback_tester():
         print(f"  {'#':>3}  {'ind_n':>6}  {'z_n':>5}  {'acc':>8}")
         print(f"  {'─'*35}")
         for i, (ind_n, z_n, acc) in enumerate(results, 1):
-            marker = " ← best" if (ind_n == best_ind_n and z_n == best_z_n) else ""
+            marker = " ← best" if (ind_n == round_best_ind_n and z_n == round_best_z_n) else ""
             print(f"  {i:>3}  {ind_n:>6}  {z_n:>5}  {acc:>8.4f}{marker}")
-        print(f"\n  Round best: ind_n={best_ind_n}  z_n={best_z_n}  acc={best_acc:.4f}")
-
-        again = input("\n  Enter next lookback list or 'done' to audit best pair: ").strip().lower()
-        if again == 'done':
-            break
+        print(f"\n  Round best  : ind_n={round_best_ind_n}  z_n={round_best_z_n}  acc={round_best_acc:.4f}")
+        print(f"  Session best: ind_n={global_best_ind_n}  z_n={global_best_z_n}  acc={global_best_acc:.4f}")
+        # loop continues — next iteration will ask for new CSV lists
 
     # ── Final audit at best pair across all rounds ────────────────────────────
-    if best_ind_n is None:
+    if global_best_ind_n is None:
         print("⚠️  No rounds completed."); return pd.DataFrame()
 
     print(f"\n{'═'*68}")
-    print(f"  🏆 OPTIMAL PAIR: indicator_n={best_ind_n}  z_n={best_z_n}")
-    print(f"     Validation accuracy = {best_acc:.4f}")
+    print(f"  🏆 OPTIMAL PAIR: indicator_n={global_best_ind_n}  z_n={global_best_z_n}")
+    print(f"     Validation accuracy = {global_best_acc:.4f}")
     print(f"{'═'*68}")
     print("\n  Running final full audit at optimal pair …\n")
 
     master_df = load_hybrid_data_parallel(
         brain_name, symbols,
-        indicator_n=best_ind_n, z_n=best_z_n,
+        indicator_n=global_best_ind_n, z_n=global_best_z_n,
         selected_features=selected,
         start_date=start_date, end_date=end_date,
     )
@@ -961,7 +966,7 @@ def run_lookback_tester():
 
     # ── Export ─────────────────────────────────────────────────────────────────
     fname = (f"JointOpt_{brain_name}_"
-             f"ind{best_ind_n}_z{best_z_n}_"
+             f"ind{global_best_ind_n}_z{global_best_z_n}_"
              f"{_dt.now().strftime('%Y%m%d_%H%M%S')}.csv")
     fpath = os.path.join(OUTPUT_DIR, fname)
     ledger.to_csv(fpath, index=False)
