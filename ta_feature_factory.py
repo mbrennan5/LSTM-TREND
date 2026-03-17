@@ -15,8 +15,10 @@
 #   BO finds the joint optimum; GA-style filtering is left to the BRAIN_LOCKS.
 # ==============================================================================
 from __future__ import annotations
-import os, gc, warnings, datetime, random, functools
+import os, gc, warnings, datetime, random, functools, logging
 warnings.filterwarnings('ignore')
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+logging.getLogger('peewee').setLevel(logging.CRITICAL)
 
 # ── Bayesian Optimisation ──────────────────────────────────────────────────────
 try:
@@ -815,10 +817,8 @@ def generate_judicial_ledger(brain_name, report_df, master_data_df, iteration=1)
 def _bo_objective(params,
                   symbols, start_date, end_date,
                   selected_features, brain_name, model_type) -> float:
-    """Objective for gp_minimize — returns (1 − accuracy) to minimise."""
+    """Returns (1 − accuracy) — lower is better."""
     ind_n, z_n = int(params[0]), int(params[1])
-    if z_n > ind_n * 4:          # physically degenerate: lens >> indicator
-        return 1.0
     master_df = load_hybrid_data_parallel(
         brain_name, symbols,
         indicator_n=ind_n, z_n=z_n,
