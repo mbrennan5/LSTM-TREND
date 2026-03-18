@@ -20,12 +20,16 @@ warnings.filterwarnings('ignore')
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 logging.getLogger('peewee').setLevel(logging.CRITICAL)
 
+# ── Core numerics first (prevents pandas circular-import with skopt) ──────────
+import numpy as np
+import pandas as pd
+
 # ── Bayesian Optimisation ──────────────────────────────────────────────────────
 try:
     from skopt import gp_minimize
     from skopt.space import Integer as SkInt
     HAS_SKOPT = True
-except ImportError:
+except (ImportError, AttributeError):
     HAS_SKOPT = False
     print("⚠️  scikit-optimize not found  →  pip install scikit-optimize")
     print("   Falling back to exhaustive grid search.")
@@ -63,7 +67,7 @@ print(f"[SYSTEM] Active compute device: {DEVICE}\n")
 # ==============================================================================
 # BLOCK 1: SYSTEM INITIALISATION  (Ron Harper 4.30)
 # ==============================================================================
-import numpy as np, pandas as pd, yfinance as yf
+import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from tensorflow.keras.models    import Sequential
 from tensorflow.keras.layers    import GRU, LSTM, Dense, Input, Dropout
